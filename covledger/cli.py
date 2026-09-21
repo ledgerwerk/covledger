@@ -12,6 +12,7 @@ from typing import Any
 from . import __version__
 from .diffing import diff_runs
 from .gaps import gaps_for_run
+from .ledgercore_backend import initialize_covledger
 from .next_query import next_query
 from .quality import quality_report
 from .runner import UnsupportedCommand, run_pytest
@@ -192,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=".", help="project root (default: current directory)")
     sub = parser.add_subparsers(dest="command_name", required=True)
 
+    init = sub.add_parser("init", help="initialize canonical Ledgercore storage for CovLedger")
+    init.add_argument("--external-root", default="../ledger")
+    init.add_argument("--project-name")
+    init.add_argument("--runs-storage", choices=["external", "user-data", "project"], default="external")
+    init.add_argument("--json", action="store_true", dest="json_output")
+
     run = sub.add_parser("run", help="run pytest through the coverage backend")
     run.add_argument("command", nargs=argparse.REMAINDER, help="pytest command after --")
     run.add_argument("--json", action="store_true", dest="json_output")
@@ -230,6 +237,35 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = _root(args.root)
     try:
+        if args.command_name == "init":
+            initialized = initialize_covledger(
+                root,
+                project_name=args.project_name,
+                runs_storage=args.runs_storage,
+                external_root=args.external_root,
+            )
+            runs_mount = initialized.layout.mounts["runs"]
+            cache_mount = initialized.layout.mounts["cache"]
+            result = {
+                "project_root": str(initialized.layout.project_root),
+                "project_uuid": initialized.manifest.project_uuid,
+                "project_name": initialized.manifest.project_name,
+                "manifest": str(initialized.layout.manifest_path),
+                "config": str(initialized.layout.tool_config_path),
+                "runs": str(runs_mount.path),
+                "cache": str(cache_mount.path),
+                "runs_storage": runs_mount.storage,
+                "external_root": str(runs_mount.root) if runs_mount.root is not None else None,
+            }
+            if args.json_output:
+                _json(result)
+            else:
+                print("initialized covledger")
+                print(f"project: {result['project_name']} ({result['project_uuid']})")
+                print(f"config: {result['config']}")
+                print(f"runs: {result['runs']}")
+                print(f"cache: {result['cache']}")
+            return 0
         if args.command_name == "run":
             report = run_pytest(root, _strip_separator(args.command))
             if args.json_output:

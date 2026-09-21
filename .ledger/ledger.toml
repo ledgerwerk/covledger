@@ -24,7 +24,8 @@ storage = "project"
 storage = "cache"
 
 [ledgers.covledger.mounts.runs]
-storage = "project"
+storage = "external"
+root = "../ledger"
 
 [ledgers.covledger.mounts.cache]
-storage = "project"
+storage = "cache"

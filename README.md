@@ -90,26 +90,39 @@ The bundled MVP semantic rules are:
 
 PyJev authentication follows PyJev's own configuration and credential handling.
 
-## Evidence layout
+## First run and storage layout
 
-Everything lives below `.covledger/`:
+Initialize the canonical Ledgercore project before collecting evidence:
 
-```text
-.covledger/
-├── runs/
-│   └── run_20260921T120000Z_ab12cd/
-│       ├── run.json
-│       ├── coverage.raw.json
-│       ├── .coverage
-│       ├── coveragerc
-│       └── sources/
-│           └── package/module.py
-└── cache/
-    └── jev/
+```bash
+covledger init
+covledger run -- pytest -q
+covledger runs latest
+covledger next
 ```
 
-Published `run.json` files are not rewritten. `latest` is only a selector.
+CovLedger keeps project identity and tool configuration in the checkout, but stores generated evidence outside Git by default:
 
+```text
+project checkout
+└── .ledger/
+    ├── ledger.toml
+    └── covledger/
+        ├── .ledger-project.toml
+        └── config.toml
+
+sibling store
+└── ../ledger/
+    ├── .ledger-store.toml
+    └── covledger/
+        └── <project-uuid>/
+            └── runs/
+                └── <uuidv7>/
+```
+
+The CovLedger registration in `.ledger/ledger.toml` controls the external root. Ledgercore namespaces persistent runs by tool name and project UUID, so multiple repositories can safely share `../ledger`. Semantic cache data uses Ledgercore's platform cache and is also outside the checkout.
+
+Published run directories use the canonical UUIDv7 run ID exactly. Published `run.json` files are immutable, and `latest` is only a selector. CovLedger does not create or use `.covledger` as active storage.
 ## Design invariants
 
 1. Unknown evidence is never silently treated as covered.

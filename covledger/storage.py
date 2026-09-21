@@ -12,20 +12,15 @@ from ledgercore import (
     atomic_create_text,
     dumps_json,
     ensure_inside_base,
-    initialize_config_binding,
-    initialize_storage_binding,
     load_json_object,
-    load_ledger_project,
     parse_uuid7,
     relative_to_base,
-    resolve_ledger_layout,
     uuid7,
-    validate_ledger_layout_storage,
 )
 
-STATE_DIR = ".covledger"
+from .ledgercore_backend import load_covledger_ledger_layout
+
 RUNS_DIR = "runs"
-CACHE_DIR = "cache"
 
 
 class RunNotFound(ValueError):
@@ -39,65 +34,20 @@ class CovLedgerLayout:
     cache_path: Path
     tool_config_path: Path
     ledgercore: Any | None = None
-    legacy: bool = False
-
-
-def _legacy_layout(root: Path) -> CovLedgerLayout:
-    state = root / STATE_DIR
-    return CovLedgerLayout(root, state / RUNS_DIR, state / CACHE_DIR, state / "config.toml", legacy=True)
 
 
 def load_covledger_layout(root: Path, *, for_write: bool = False) -> CovLedgerLayout:
-    """Resolve CovLedger through the Ledgercore project manifest."""
-    root = root.resolve()
-    manifest = root / ".ledger" / "ledger.toml"
-    if not manifest.is_file():
-        return _legacy_layout(root)
-    project = load_ledger_project(root)
-    try:
-        layout = resolve_ledger_layout(
-            project.locator,
-            project.manifest,
-            "covledger",
-            local_overrides=project.local_overrides,
-        )
-    except Exception as exc:
-        raise ValueError(f"unable to resolve CovLedger Ledgercore layout: {exc}") from exc
-    try:
-        runs = layout.mounts["runs"].path
-        cache = layout.mounts["cache"].path
-    except KeyError as exc:
-        raise ValueError("CovLedger layout must define runs and cache mounts") from exc
-    result = CovLedgerLayout(root, runs, cache, layout.tool_config_path, layout)
-    if for_write:
-        _prepare_layout(result)
-    else:
-        try:
-            validate_ledger_layout_storage(layout)
-        except Exception as exc:
-            if runs.exists() or cache.exists() or layout.tool_config_path.parent.exists():
-                raise ValueError(f"invalid CovLedger Ledgercore storage binding: {exc}") from exc
-    return result
+    """Resolve and validate the canonical CovLedger Ledgercore layout."""
+    del for_write
+    layout = load_covledger_ledger_layout(root)
+    return CovLedgerLayout(
+        layout.project_root,
+        layout.mounts["runs"].path,
+        layout.mounts["cache"].path,
+        layout.tool_config_path,
+        layout,
+    )
 
-
-def _prepare_layout(layout: CovLedgerLayout) -> None:
-    if layout.legacy:
-        layout.runs_path.mkdir(parents=True, exist_ok=True)
-        layout.cache_path.mkdir(parents=True, exist_ok=True)
-        return
-    core = layout.ledgercore
-    assert core is not None
-    layout.tool_config_path.parent.mkdir(parents=True, exist_ok=True)
-    if not core.config_binding_path.exists():
-        initialize_config_binding(core)
-    for mount_name in ("runs", "cache"):
-        mount = core.mounts[mount_name]
-        if not mount.binding_path.exists():
-            if mount.path.exists() and any(mount.path.iterdir()):
-                raise ValueError(f"refusing to adopt non-empty unbound mount: {mount.path}")
-            initialize_storage_binding(mount, require_empty=True)
-    layout.runs_path.mkdir(parents=True, exist_ok=True)
-    layout.cache_path.mkdir(parents=True, exist_ok=True)
 
 def load_covledger_config(root: Path) -> dict[str, Any]:
     import tomllib
@@ -133,16 +83,13 @@ def cache_root(root: Path) -> Path:
 
 
 def list_run_ids(root: Path) -> list[str]:
-    layout = load_covledger_layout(root)
-    directory = layout.runs_path
-    if not directory.exists():
-        return []
+    directory = runs_root(root)
     result: list[str] = []
     for path in directory.iterdir():
         if not path.is_dir() or not (path / "run.json").is_file():
             continue
         try:
-            run_id = path.name if layout.legacy else validate_run_id(path.name)
+            run_id = validate_run_id(path.name)
             load_json_object(path / "run.json", label="run metadata")
         except (OSError, ValueError, TypeError):
             continue
@@ -156,9 +103,8 @@ def resolve_run_id(root: Path, selector: str) -> str:
         if not runs:
             raise RunNotFound("no CovLedger runs found")
         return runs[0]
-    layout = load_covledger_layout(root)
-    run_id = selector if layout.legacy else validate_run_id(selector)
-    path = layout.runs_path / run_id / "run.json"
+    run_id = validate_run_id(selector)
+    path = runs_root(root) / run_id / "run.json"
     if not path.is_file():
         raise RunNotFound(f"run not found: {selector}")
     return run_id
@@ -191,7 +137,7 @@ def load_artifact(root: Path, selector: str, name: str) -> dict[str, Any]:
 
 
 def stage_run(root: Path, run_id: str | None = None) -> Path:
-    layout = load_covledger_layout(root, for_write=True)
+    layout = load_covledger_layout(root)
     canonical_id = validate_run_id(run_id or new_run_id())
     while True:
         stage = layout.runs_path / f".tmp-{canonical_id}-{secrets.token_hex(6)}"
@@ -204,8 +150,7 @@ def stage_run(root: Path, run_id: str | None = None) -> Path:
 
 def publish_staged_run(stage_dir: Path, run_id: str) -> Path:
     run_id = validate_run_id(run_id)
-    runs_dir = stage_dir.parent
-    target = runs_dir / run_id
+    target = stage_dir.parent / run_id
     if target.exists():
         raise FileExistsError(f"refusing to rewrite published run: {target}")
     os.replace(stage_dir, target)
@@ -218,12 +163,12 @@ def publish_artifact(directory: Path, name: str, payload: dict[str, Any]) -> Non
 
 
 def publish_run(run_dir: Path, report: dict[str, Any]) -> None:
-    """Compatibility helper for direct publication and legacy tests."""
+    """Compatibility helper for direct publication."""
     target = run_dir / "run.json"
     run_dir.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise FileExistsError(f"refusing to rewrite published run: {target}")
-    if run_dir.parent.name == RUNS_DIR and not run_dir.name.startswith("run_"):
+    if run_dir.parent.name == RUNS_DIR:
         validate_run_id(run_dir.name)
     if "coverage" in report and "scope" in report:
         metadata = dict(report)

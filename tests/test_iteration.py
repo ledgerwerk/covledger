@@ -2,6 +2,7 @@ from pathlib import Path
 
 from covledger.diffing import diff_runs
 from covledger.gaps import derive_gaps
+from covledger.ledgercore_backend import initialize_covledger
 from covledger.next_query import next_query
 from covledger.quality import semantic_cache_key
 from covledger.runner import run_pytest
@@ -42,6 +43,7 @@ def test_next_selects_uncovered_error_path_without_semantic_cache(tmp_path: Path
         "    assert process(1) == 1\n",
         encoding="utf-8",
     )
+    initialize_covledger(tmp_path)
     run = run_pytest(tmp_path, ["pytest", "-q"])
     result = next_query(tmp_path)
     assert result["status"] == "ok"
@@ -54,6 +56,7 @@ def test_next_selects_uncovered_error_path_without_semantic_cache(tmp_path: Path
 
 def test_next_blocks_failed_suite(tmp_path: Path) -> None:
     (tmp_path / "test_failure.py").write_text("def test_failure():\n    assert False\n", encoding="utf-8")
+    initialize_covledger(tmp_path)
     run = run_pytest(tmp_path, ["pytest", "-q"])
     assert run["exit_code"] != 0
     assert next_query(tmp_path) == {
