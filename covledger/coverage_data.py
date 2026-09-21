@@ -10,6 +10,7 @@ from typing import Any
 
 from ledgercore import ensure_inside_base, relative_to_base
 
+from .analysis_scope import AnalysisScope
 from .model import CoverageFile
 
 
@@ -51,11 +52,23 @@ def unavailable_coverage(error: BaseException) -> dict[str, Any]:
     }
 
 
-def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def normalize_coverage(
+    raw_json: Path,
+    *,
+    project_root: Path,
+    run_dir: Path,
+    allowed_paths: frozenset[str] | set[str] | None = None,
+    analysis_scope: AnalysisScope | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    scope_artifact = {
+        "schema_version": 2,
+        "analysis": analysis_scope.to_dict() if analysis_scope is not None else {},
+        "files": {},
+    }
     try:
         raw = json.loads(raw_json.read_text(encoding="utf-8"))
     except Exception as exc:
-        return unavailable_coverage(exc), {"schema_version": 1, "files": {}}
+        return unavailable_coverage(exc), scope_artifact
     files: dict[str, dict[str, Any]] = {}
     scope_files: dict[str, dict[str, Any]] = {}
     source_root = run_dir / "sources"
@@ -67,6 +80,8 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
             display_path = relative_to_base(project_root.resolve(), source_path)
         else:
             display_path = Path(raw_path).as_posix()
+        if allowed_paths is not None and display_path not in allowed_paths:
+            continue
         source_hash = _sha256(source_path) if source_path and source_path.is_file() else None
         if source_path and source_path.is_file() and source_hash:
             snapshot = source_root / display_path
@@ -91,17 +106,18 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
         )
         files[display_path] = evidence.to_dict()
 
-    totals = raw.get("totals", {})
-    statements = int(totals.get("num_statements", 0))
-    covered_lines = int(totals.get("covered_lines", 0))
+    retained = list(files.values())
+    statements = sum(int(item["statements"]) for item in retained)
+    covered_lines = sum(int(item["covered_lines"]) for item in retained)
+    branches = sum(int(item["branches"]) for item in retained)
+    covered_branches = sum(int(item["covered_branches"]) for item in retained)
     executed_lines = tuple(int(line) for line in raw.get("executed_lines", []))
-    branches = int(totals.get("num_branches", 0))
-    covered_branches = int(totals.get("covered_branches", 0))
     executed_branches = tuple(tuple(map(int, branch)) for branch in raw.get("executed_branches", []))
     coverage = {
         "schema_version": 2,
         "status": "available",
-        "backend": _backend() | {
+        "backend": _backend()
+        | {
             "version": raw.get("meta", {}).get("version"),
             "branch": bool(raw.get("meta", {}).get("branch_coverage", False)),
         },
@@ -119,7 +135,8 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
         },
         "files": files,
     }
-    return coverage, {"schema_version": 1, "files": scope_files}
+    scope_artifact["files"] = scope_files
+    return coverage, scope_artifact
 
 
 def function_coverage(function: Any, coverage_file: dict[str, Any]) -> dict[str, Any]:

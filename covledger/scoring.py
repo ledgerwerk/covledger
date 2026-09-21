@@ -37,8 +37,10 @@ def hazard_score(facts: dict[str, Any], config: dict[str, Any] | None = None) ->
     product = 1.0
     for finding, weight in weights.items():
         if (
-            finding == "bare-except" and facts.get("bare_except")
-            or finding == "broad-except" and facts.get("broad_except")
+            finding == "bare-except"
+            and facts.get("bare_except")
+            or finding == "broad-except"
+            and facts.get("broad_except")
         ):
             product *= 1.0 - float(weight)
         elif finding == "dynamic-code-execution" and facts.get("eval_exec_calls"):
@@ -69,8 +71,7 @@ def quality_score(facts: dict[str, Any], config: dict[str, Any] | None = None) -
     hazard = hazard_score(facts, source)
     structural = structural_score(facts, source)
     total = (
-        float(source["quality"]["hazard_weight"]) * hazard
-        + float(source["quality"]["structure_weight"]) * structural
+        float(source["quality"]["hazard_weight"]) * hazard + float(source["quality"]["structure_weight"]) * structural
     )
     findings = set(facts.get("exact_findings", []))
     if findings & {"bare-except", "broad-except"} and structural >= 50:
@@ -117,9 +118,7 @@ def priority_score(
         )
     )
     bonuses: list[dict[str, Any]] = []
-    if gap_kind == "error-path" and (
-        facts.get("bare_except", False) or facts.get("broad_except", False)
-    ):
+    if gap_kind == "error-path" and (facts.get("bare_except", False) or facts.get("broad_except", False)):
         bonuses.append({"points": 12, "reason": "uncovered error path and exception hazard"})
     if gap_kind == "branch" and facts.get("decision_count", 0) >= 10:
         bonuses.append({"points": 8, "reason": "uncovered branch and many decisions"})
@@ -156,16 +155,12 @@ def semantic_score(judgments: dict[str, Any], weights: dict[str, float] | None =
     return round(_clamp(100.0 * (1.0 - product)))
 
 
-
 def semantic_modifier(judgments: dict[str, Any]) -> int:
     return round(15 * semantic_score(judgments) / 100)
 
 
-
 def augmented_priority(priority: int, judgments: dict[str, Any]) -> int:
     return round(_clamp(priority + semantic_modifier(judgments)))
-
-
 
 
 __all__ = [

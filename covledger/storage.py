@@ -59,7 +59,11 @@ def load_covledger_config(root: Path) -> dict[str, Any]:
             "ledger": {"code": "cov", "name": "covledger"},
             "coverage": {"branch": True},
             "quality": {"semantic_threshold": 0.70},
-            "analysis": {"include_generated": False, "exclude": ["context_*.unpack.py"]},
+            "analysis": {
+                "include_generated": False,
+                "include": [],
+                "exclude": ["context_*.unpack.py"],
+            },
             "priority": {"high": 70, "critical": 85, "campaign_high_count": 3},
         }
     return tomllib.loads(layout.tool_config_path.read_text(encoding="utf-8"))

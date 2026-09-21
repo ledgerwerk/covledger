@@ -14,10 +14,12 @@ import coverage
 from ledgercore import write_json
 
 from . import __version__
+from .analysis_scope import AnalysisScope, analysis_scope_from_config
 from .assessment import build_assessment
 from .coverage_data import normalize_coverage, unavailable_coverage
 from .quality import quality_document_from_sources
-from .storage import new_run_id, publish_staged_run, stage_run
+from .source import discover_python_files
+from .storage import load_covledger_config, new_run_id, publish_staged_run, stage_run
 
 
 class UnsupportedCommand(ValueError):
@@ -63,19 +65,47 @@ skip_empty = True
     path.write_text(text, encoding="utf-8")
 
 
-def _load_coverage(stage: Path, root: Path, data_file: Path, raw_json: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_coverage(
+    stage: Path,
+    root: Path,
+    data_file: Path,
+    raw_json: Path,
+    analysis_files: list[Path],
+    allowed_paths: frozenset[str],
+    analysis_scope: AnalysisScope,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         cov = coverage.Coverage(data_file=str(data_file), branch=True, source=[str(root)])
         cov.load()
-        cov.json_report(outfile=str(raw_json), pretty_print=True)
-        return normalize_coverage(raw_json, project_root=root, run_dir=stage)
+        cov.json_report(
+            morfs=[str(path) for path in analysis_files],
+            outfile=str(raw_json),
+            pretty_print=True,
+        )
+        return normalize_coverage(
+            raw_json,
+            project_root=root,
+            run_dir=stage,
+            allowed_paths=allowed_paths,
+            analysis_scope=analysis_scope,
+        )
     except Exception as exc:
-        return unavailable_coverage(exc), {"schema_version": 1, "files": {}}
+        return unavailable_coverage(exc), {
+            "schema_version": 2,
+            "analysis": analysis_scope.to_dict(),
+            "files": {},
+        }
 
 
 def run_pytest(root: Path, command: list[str]) -> dict[str, Any]:
     root = root.resolve()
     pytest_args = _pytest_args(command)
+    config = load_covledger_config(root)
+    analysis_scope = analysis_scope_from_config(config)
+    analysis_files = discover_python_files(root, root=root, scope=analysis_scope)
+    if analysis_scope.include and not analysis_files:
+        raise ValueError("analysis.include matched no eligible Python source files")
+    allowed_paths = frozenset(path.relative_to(root).as_posix() for path in analysis_files)
     started = time.monotonic()
     run_id = new_run_id()
     stage = stage_run(root, run_id)
@@ -99,7 +129,15 @@ def run_pytest(root: Path, command: list[str]) -> dict[str, Any]:
         *pytest_args,
     ]
     completed = subprocess.run(executed, cwd=root, env=env, check=False)
-    coverage_data, scope = _load_coverage(stage, root, data_file, raw_json)
+    coverage_data, scope = _load_coverage(
+        stage,
+        root,
+        data_file,
+        raw_json,
+        analysis_files,
+        allowed_paths,
+        analysis_scope,
+    )
 
     sources = {
         path: stage / entry["snapshot"]

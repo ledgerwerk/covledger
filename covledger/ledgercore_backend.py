@@ -41,6 +41,7 @@ semantic_threshold = 0.70
 
 [analysis]
 include_generated = false
+include = []
 exclude = [
   "context_*.unpack.py",
 ]
@@ -63,9 +64,7 @@ def locate_covledger_project(start: Path) -> Any:
     return locate_ledger_project(start)
 
 
-def _covledger_registration(
-    *, runs_storage: str, external_root: str | None
-) -> LedgerRegistration:
+def _covledger_registration(*, runs_storage: str, external_root: str | None) -> LedgerRegistration:
     if runs_storage not in {"external", "user-data", "project"}:
         raise ValueError(f"unsupported CovLedger runs storage {runs_storage!r}")
     return LedgerRegistration(
@@ -155,26 +154,20 @@ def ensure_covledger_ledger_registration(
     return candidate
 
 
-def load_covledger_ledger_layout(
-    start: Path, *, validate_storage: bool = True
-) -> Any:
+def load_covledger_ledger_layout(start: Path, *, validate_storage: bool = True) -> Any:
     """Load and optionally validate the canonical CovLedger layout."""
     root = start.expanduser().resolve()
     locator = locate_covledger_project(root)
     if locator is None or locator.is_legacy:
         legacy = root / ".covledger"
         suffix = " Legacy .covledger storage is unsupported." if legacy.exists() else ""
-        raise ValueError(
-            f"CovLedger is not initialized for this project. Run `covledger init`.{suffix}"
-        )
+        raise ValueError(f"CovLedger is not initialized for this project. Run `covledger init`.{suffix}")
     if locator.project_root != root:
         raise ValueError(f"Ledger project root is {locator.project_root}, not {root}")
 
     loaded = load_ledger_project(root)
     if TOOL_NAME not in loaded.manifest.ledgers:
-        raise ValueError(
-            "CovLedger is not registered in .ledger/ledger.toml. Run `covledger init`."
-        )
+        raise ValueError("CovLedger is not registered in .ledger/ledger.toml. Run `covledger init`.")
     try:
         layout = resolve_ledger_layout(
             loaded.locator,
@@ -193,11 +186,7 @@ def load_covledger_ledger_layout(
 
     if validate_storage:
         report = validate_ledger_layout_storage(layout)
-        invalid = [
-            (result.path, result.reason)
-            for result in report.results
-            if not result.valid
-        ]
+        invalid = [(result.path, result.reason) for result in report.results if not result.valid]
         if layout.config_binding_path is not None and not layout.config_binding_path.is_file():
             invalid.append((layout.config_binding_path, "configuration binding marker is missing"))
         for mount in layout.mounts.values():

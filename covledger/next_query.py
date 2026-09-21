@@ -42,7 +42,8 @@ def _candidate(assessment: dict[str, Any], hotspot: dict[str, Any], gap: dict[st
         "why": [
             "uncovered behavior",
             f"priority score {hotspot['score']['priority']}",
-        ] + (["deterministic findings"] if finding_ids else []),
+        ]
+        + (["deterministic findings"] if finding_ids else []),
         "current_source": hotspot["current_source"],
         "repository_context": {
             "work_mode": assessment["summary"]["work_mode"],

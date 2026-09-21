@@ -4,40 +4,45 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
-import tomllib
 from pathlib import Path
 from typing import Any
 
 from ledgercore import dumps_json, load_json_object, write_json
 
+from .analysis_scope import AnalysisScope, analysis_scope_from_config
 from .identity import finding_id, function_id
 from .scoring import attention_band, augmented_priority, priority_score, rules_sha256, semantic_modifier, semantic_score
 from .source import FunctionFacts, discover_python_files, extract_functions, source_sha256
-from .storage import semantic_cache_path
+from .storage import load_covledger_config, semantic_cache_path
 
 DEFAULT_THRESHOLD = 0.70
 DECISION = "covledger-quality"
 
 
-def _analysis_excludes(root: Path) -> tuple[str, ...]:
-    path = root / ".ledger" / "covledger" / "config.toml"
-    if not path.is_file():
-        return ()
-    config = tomllib.loads(path.read_text(encoding="utf-8"))
-    values = config.get("analysis", {}).get("exclude", [])
-    return tuple(str(value) for value in values)
-
+def _analysis_scope(root: Path) -> AnalysisScope:
+    config_path = root / ".ledger" / "covledger" / "config.toml"
+    if not config_path.is_file():
+        return analysis_scope_from_config({})
+    return analysis_scope_from_config(load_covledger_config(root))
 
 
 def collect_functions(
-    target: Path, *, root: Path, include_generated: bool = False
- ) -> list[FunctionFacts]:
+    target: Path,
+    *,
+    root: Path,
+    scope: AnalysisScope | None = None,
+    include_generated: bool | None = None,
+) -> list[FunctionFacts]:
+    effective_scope = scope if scope is not None else _analysis_scope(root)
     functions: list[FunctionFacts] = []
-    excludes = _analysis_excludes(root)
-    for path in discover_python_files(target, include_generated=include_generated, excludes=excludes):
+    for path in discover_python_files(
+        target,
+        root=root,
+        scope=effective_scope,
+        include_generated=include_generated,
+    ):
         functions.extend(extract_functions(path, root=root))
     return sorted(functions, key=lambda item: (item.path, item.line, item.qualname))
-
 
 
 def facts_dict(item: FunctionFacts) -> dict[str, Any]:
@@ -86,9 +91,7 @@ def _semantic_facts(item: FunctionFacts) -> dict[str, Any]:
     ]
     facts["eval_exec_calls"] = [{"name": row["name"]} for row in item.eval_exec_call_details]
     facts["calls"] = [{"name": row["name"]} for row in item.calls]
-    facts["imports"] = [
-        {key: value for key, value in row.items() if key in {"module", "name"}} for row in item.imports
-    ]
+    facts["imports"] = [{key: value for key, value in row.items() if key in {"module", "name"}} for row in item.imports]
     return facts
 
 
@@ -101,6 +104,7 @@ def _semantic_key(item: FunctionFacts) -> str:
         "exact_facts": _semantic_facts(item),
     }
     return hashlib.sha256(dumps_json(payload, compact=True).encode("utf-8")).hexdigest()
+
 
 def semantic_cache_key(item: FunctionFacts) -> str:
     return _semantic_key(item)
@@ -162,9 +166,7 @@ def _finding_rows(item: FunctionFacts) -> list[dict[str, Any]]:
             {**row, "discriminator": f"broad-except#{index}:{row.get('caught', '')}"}
             for index, row in enumerate(item.broad_excepts, 1)
         ],
-        "mutable-default": [
-            {**row, "discriminator": f"parameter={row['parameter']}"} for row in item.mutable_defaults
-        ],
+        "mutable-default": [{**row, "discriminator": f"parameter={row['parameter']}"} for row in item.mutable_defaults],
         "dynamic-code-execution": [
             {**row, "discriminator": f"{row['name']}#{index}"}
             for index, row in enumerate(item.eval_exec_call_details, 1)
@@ -185,6 +187,7 @@ def _finding_rows(item: FunctionFacts) -> list[dict[str, Any]]:
                 }
             )
     return rows
+
 
 def quality_document_from_sources(
     sources: dict[str, Path],
@@ -259,8 +262,8 @@ def quality_report(
     threshold: float = DEFAULT_THRESHOLD,
     refresh: bool = False,
     max_functions: int | None = None,
-    include_generated: bool = False,
- ) -> dict[str, Any]:
+    include_generated: bool | None = None,
+) -> dict[str, Any]:
     functions = collect_functions(target, root=root, include_generated=include_generated)
     if max_functions is not None:
         functions = functions[:max_functions]

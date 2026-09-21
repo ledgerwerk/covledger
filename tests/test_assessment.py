@@ -7,17 +7,11 @@ from covledger.runner import run_pytest
 
 def test_run_persists_assessment_and_hotspot_scores(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text(
-        "def process(value):\n"
-        "    try:\n"
-        "        return value\n"
-        "    except Exception:\n"
-        "        return None\n",
+        "def process(value):\n    try:\n        return value\n    except Exception:\n        return None\n",
         encoding="utf-8",
     )
     (tmp_path / "test_app.py").write_text(
-        "from app import process\n\n"
-        "def test_process():\n"
-        "    assert process(1) == 1\n",
+        "from app import process\n\ndef test_process():\n    assert process(1) == 1\n",
         encoding="utf-8",
     )
     initialize_covledger(tmp_path)

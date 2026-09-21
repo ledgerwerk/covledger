@@ -32,17 +32,11 @@ def test_semantic_cache_key_ignores_path_and_start_line(tmp_path: Path) -> None:
 
 def test_next_selects_uncovered_error_path_without_semantic_cache(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text(
-        "def process(value):\n"
-        "    try:\n"
-        "        return value\n"
-        "    except Exception:\n"
-        "        return None\n",
+        "def process(value):\n    try:\n        return value\n    except Exception:\n        return None\n",
         encoding="utf-8",
     )
     (tmp_path / "test_app.py").write_text(
-        "from app import process\n\n"
-        "def test_process():\n"
-        "    assert process(1) == 1\n",
+        "from app import process\n\ndef test_process():\n    assert process(1) == 1\n",
         encoding="utf-8",
     )
     initialize_covledger(tmp_path)

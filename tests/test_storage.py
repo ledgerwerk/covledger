@@ -38,6 +38,13 @@ def test_init_uses_external_runs_and_cache(tmp_path: Path) -> None:
     assert (tmp_path / ".ledger" / "covledger" / ".ledger-project.toml").is_file()
     assert (tmp_path / ".ledger" / "covledger" / "config.toml").is_file()
 
+    config = tomllib.loads((tmp_path / ".ledger" / "covledger" / "config.toml").read_text())
+    assert config["analysis"] == {
+        "include_generated": False,
+        "include": [],
+        "exclude": ["context_*.unpack.py"],
+    }
+
 
 def test_init_is_idempotent_and_preserves_run(tmp_path: Path) -> None:
     first = initialize_covledger(tmp_path)
@@ -97,6 +104,7 @@ def test_no_covledger_fallback(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="covledger init"):
         load_covledger_layout(tmp_path)
+
 
 def test_new_project_identity_is_uuidv7(tmp_path: Path) -> None:
     initialized = initialize_covledger(tmp_path)

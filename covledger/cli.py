@@ -185,6 +185,7 @@ def _print_next(result: dict[str, Any]) -> None:
     print("queue:")
     print("    covledger findings --min-score 70")
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="covledger", description="Python test evidence for coding agents.")
     parser.add_argument("--version", action="version", version=f"covledger {__version__}")
@@ -220,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     quality.add_argument("--threshold", type=float, default=0.70)
     quality.add_argument("--refresh", action="store_true")
     quality.add_argument("--max-functions", type=int)
-    quality.add_argument("--include-generated", action="store_true")
+    quality.add_argument("--include-generated", action="store_true", default=None)
     quality.add_argument("--top", type=int)
     quality.add_argument("--json", action="store_true", dest="json_output")
 
@@ -255,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _strip_separator(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
+
 def _handle_init(root: Path, args: argparse.Namespace) -> int:
     initialized = initialize_covledger(
         root,
@@ -286,7 +288,6 @@ def _handle_init(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-
 def _handle_run(root: Path, args: argparse.Namespace) -> int:
     report = run_pytest(root, _strip_separator(args.command))
     if args.json_output:
@@ -294,7 +295,6 @@ def _handle_run(root: Path, args: argparse.Namespace) -> int:
     else:
         _print_summary(report)
     return int(report["exit_code"])
-
 
 
 def _run_details(root: Path, run_id: str) -> dict[str, Any]:
@@ -319,7 +319,6 @@ def _run_details(root: Path, run_id: str) -> dict[str, Any]:
     }
 
 
-
 def _print_run_table(rows: list[dict[str, Any]]) -> None:
     print("RUN       SUITE  LINES   BRANCH  GAPS  HIGH  CRIT  TOP")
     for row in rows:
@@ -333,10 +332,7 @@ def _print_run_table(rows: list[dict[str, Any]]) -> None:
             row["critical_count"] if row["critical_count"] is not None else "?",
             row["top_priority_score"] if row["top_priority_score"] is not None else "?",
         ]
-        print(
-            f"{run:<9} {suite:<6} {lines:>6} {branch:>7} "
-            f"{values[0]:>5} {values[1]:>5} {values[2]:>5} {values[3]:>5}"
-        )
+        print(f"{run:<9} {suite:<6} {lines:>6} {branch:>7} {values[0]:>5} {values[1]:>5} {values[2]:>5} {values[3]:>5}")
 
 
 def _handle_runs(root: Path, args: argparse.Namespace) -> int:
@@ -385,7 +381,6 @@ def _handle_runs(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-
 def _handle_diff(root: Path, args: argparse.Namespace) -> int:
     result = diff_runs(load_run(root, args.older), load_run(root, args.newer))
     if args.json_output:
@@ -393,7 +388,6 @@ def _handle_diff(root: Path, args: argparse.Namespace) -> int:
     else:
         _print_diff(result)
     return 0
-
 
 
 def _handle_quality(root: Path, args: argparse.Namespace) -> int:
@@ -432,7 +426,6 @@ def _handle_quality(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-
 def _handle_next(root: Path, args: argparse.Namespace) -> int:
     result = next_query(root, args.selector)
     if args.json_output:
@@ -442,11 +435,9 @@ def _handle_next(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-
 def _load_assessment(root: Path, selector: str) -> tuple[dict[str, Any], dict[str, Any]]:
     run = load_run(root, selector)
     return run, assessment_for_run(root, run)
-
 
 
 def _handle_overview(root: Path, args: argparse.Namespace) -> int:
@@ -492,7 +483,6 @@ def _handle_overview(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-
 def _handle_findings(root: Path, args: argparse.Namespace) -> int:
     _, assessment = _load_assessment(root, args.selector)
     rows = []
@@ -507,8 +497,7 @@ def _handle_findings(root: Path, args: argparse.Namespace) -> int:
         if args.kind and not any(
             gap["gap"]["kind"] == args.kind
             for gap in assessment["gaps"]
-            if (gap.get("function") or {}).get("qualname") == hotspot["qualname"]
-            and gap.get("path") == hotspot["path"]
+            if (gap.get("function") or {}).get("qualname") == hotspot["qualname"] and gap.get("path") == hotspot["path"]
         ):
             continue
         if args.rule and not any(
@@ -548,7 +537,6 @@ def _handle_findings(root: Path, args: argparse.Namespace) -> int:
             f"{row['path']}:{row['line']} {row['qualname']}  {reason}"
         )
     return 0
-
 
 
 def _handle_inspect(root: Path, args: argparse.Namespace) -> int:
@@ -635,8 +623,6 @@ def _handle_inspect(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-
-
 HANDLERS = {
     "init": _handle_init,
     "run": _handle_run,
@@ -648,7 +634,6 @@ HANDLERS = {
     "quality": _handle_quality,
     "next": _handle_next,
 }
-
 
 
 def main(argv: list[str] | None = None) -> int:

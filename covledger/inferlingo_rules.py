@@ -20,7 +20,7 @@ def rules_sha256() -> str:
 
 def _facts_for_hotspot(
     assessment: dict[str, Any], hotspot: dict[str, Any]
- ) -> list[tuple[str, dict[str, str], Provenance]]:
+) -> list[tuple[str, dict[str, str], Provenance]]:
     fn = hotspot["id"]
     provenance = Provenance(
         source=hotspot["path"],
