@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
   "coverage>=7.10,<8",
+  "ledgercore>=0.6,<1",
   "pyjev>=0.1,<1",
 ]
 

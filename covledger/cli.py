@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .diffing import diff_runs
+from .gaps import gaps_for_run
+from .next_query import next_query
 from .quality import quality_report
 from .runner import UnsupportedCommand, run_pytest
-from .storage import RunNotFound, list_run_ids, load_run, resolve_run_id, runs_root
+from .storage import RunNotFound, list_run_ids, load_run, runs_root
 
 
 def _root(value: str) -> Path:
@@ -22,16 +26,35 @@ def _json(data: Any) -> None:
     print(json.dumps(data, indent=2, sort_keys=True))
 
 
-def _totals(run: dict[str, Any]) -> dict[str, Any]:
-    return run["coverage"]["totals"]
+def _run_dir(root: Path, run: dict[str, Any]) -> Path:
+    return runs_root(root) / run["run_id"]
+
+
+def _current_status(root: Path, path: str, expected: str | None) -> str:
+    current = (root / path).resolve()
+    if not current.is_file():
+        return "missing"
+    digest = hashlib.sha256(current.read_bytes()).hexdigest()
+    return "fresh" if expected and digest == expected else "changed"
+
+
+def _totals(run: dict[str, Any]) -> dict[str, Any] | None:
+    return run.get("coverage", {}).get("totals")
 
 
 def _print_summary(run: dict[str, Any]) -> None:
-    totals = _totals(run)
-    status = "passed" if run["suite_passed"] else f"failed ({run['exit_code']})"
+    suite = run.get("suite", {})
+    passed = run.get("suite_passed", suite.get("passed", False))
+    exit_code = run.get("exit_code", suite.get("exit_code"))
+    status = "passed" if passed else f"failed ({exit_code})"
     print(f"run {run['run_id']}")
     print(f"suite: {status}")
-    print(f"command: {' '.join(run['command'])}")
+    print(f"command: {' '.join(run.get('command', suite.get('command', [])))}")
+    coverage = run.get("coverage", {})
+    if coverage.get("status") != "available":
+        print("coverage: unavailable")
+        return
+    totals = coverage["totals"]
     print()
     print(f"Lines     {totals['line_percent']:6.2f}% ({totals['covered_lines']}/{totals['statements']})")
     if totals["branches"]:
@@ -40,81 +63,127 @@ def _print_summary(run: dict[str, Any]) -> None:
         print("Branches  n/a (0 obligations)")
 
 
-def _gaps(run: dict[str, Any], limit: int) -> list[tuple[str, dict[str, Any]]]:
-    files = run["coverage"]["files"]
-    rows = [
-        (path, item)
-        for path, item in files.items()
-        if item["missing_lines"] or item["missing_branches"]
-    ]
-    rows.sort(key=lambda pair: (-len(pair[1]["missing_branches"]), -len(pair[1]["missing_lines"]), pair[0]))
-    return rows[:limit]
+def _gaps(root: Path, run: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    return [candidate.to_dict() for candidate in gaps_for_run(run, _run_dir(root, run))[:limit]]
 
 
-def _print_gaps(run: dict[str, Any], limit: int) -> None:
-    rows = _gaps(run, limit)
+def _print_gaps(root: Path, run: dict[str, Any], limit: int) -> None:
+    rows = _gaps(root, run, limit)
     if not rows:
         print("No unresolved line or branch gaps.")
         return
-    for path, item in rows:
-        print(path)
-        print(f"  missing lines: {item['missing_lines'] or 'none'}")
-        print(f"  missing branches: {item['missing_branches'] or 'none'}")
+    for row in rows:
+        gap = row["gap"]
+        print(f"{row['path']}:{row['line']}  {gap['kind']}: {gap['label']}")
+        if "from_line" in gap:
+            print(f"  {gap['from_line']} -> {gap['to_line']}")
 
 
-def _print_file(root: Path, selector: str, run: dict[str, Any], path: str) -> None:
-    item = run["coverage"]["files"].get(path)
+def _file_result(root: Path, run: dict[str, Any], path: str) -> dict[str, Any]:
+    item = run.get("coverage", {}).get("files", {}).get(path)
     if item is None:
         raise ValueError(f"file not measured in run: {path}")
+    result = {
+        "run_id": run["run_id"],
+        "path": path,
+        "coverage": item,
+        "current_file": _current_status(root, path, item.get("source_sha256")),
+        "gaps": [candidate.to_dict() for candidate in gaps_for_run(run, _run_dir(root, run)) if candidate.path == path],
+    }
+    snapshot = _run_dir(root, run) / "sources" / path
+    if snapshot.is_file():
+        lines = snapshot.read_text(encoding="utf-8", errors="replace").splitlines()
+        result["source_excerpts"] = [
+            {"line": number, "text": lines[number - 1] if 0 < number <= len(lines) else ""}
+            for number in item.get("missing_lines", [])[:20]
+        ]
+    return result
+
+
+def _print_file(root: Path, run: dict[str, Any], path: str) -> None:
+    result = _file_result(root, run, path)
+    item = result["coverage"]
     print(path)
     print(f"  lines: {item['line_percent']:.2f}% ({item['covered_lines']}/{item['statements']})")
     print(f"  branches: {item['branch_percent']:.2f}% ({item['covered_branches']}/{item['branches']})")
     print(f"  missing lines: {item['missing_lines'] or 'none'}")
     print(f"  missing branches: {item['missing_branches'] or 'none'}")
-
-    run_id = resolve_run_id(root, selector)
-    snapshot = runs_root(root) / run_id / "sources" / path
-    if snapshot.is_file() and item["missing_lines"]:
-        lines = snapshot.read_text(encoding="utf-8", errors="replace").splitlines()
-        print("  source gaps:")
-        for line_number in item["missing_lines"][:20]:
-            text = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
-            print(f"    {line_number:>5}: {text}")
+    print(f"  source hash: {item.get('source_sha256')}")
+    print(f"  current-file status: {result['current_file']}")
+    for excerpt in result.get("source_excerpts", []):
+        print(f"    {excerpt['line']:>5}: {excerpt['text']}")
 
 
-def _diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
-    old_files = old["coverage"]["files"]
-    new_files = new["coverage"]["files"]
-    paths = sorted(set(old_files) | set(new_files))
-    files: dict[str, Any] = {}
-    for path in paths:
-        before = old_files.get(path, {"missing_lines": [], "missing_branches": []})
-        after = new_files.get(path, {"missing_lines": [], "missing_branches": []})
-        before_lines = set(before["missing_lines"])
-        after_lines = set(after["missing_lines"])
-        before_branches = {tuple(item) for item in before["missing_branches"]}
-        after_branches = {tuple(item) for item in after["missing_branches"]}
-        newly_covered_lines = sorted(before_lines - after_lines)
-        newly_uncovered_lines = sorted(after_lines - before_lines)
-        newly_covered_branches = sorted(before_branches - after_branches)
-        newly_uncovered_branches = sorted(after_branches - before_branches)
-        if any((newly_covered_lines, newly_uncovered_lines, newly_covered_branches, newly_uncovered_branches)):
-            files[path] = {
-                "newly_covered_lines": newly_covered_lines,
-                "newly_uncovered_lines": newly_uncovered_lines,
-                "newly_covered_branches": [list(item) for item in newly_covered_branches],
-                "newly_uncovered_branches": [list(item) for item in newly_uncovered_branches],
-            }
-    return {
-        "older": old["run_id"],
-        "newer": new["run_id"],
-        "suite_passed": new["suite_passed"],
-        "line_percent_before": _totals(old)["line_percent"],
-        "line_percent_after": _totals(new)["line_percent"],
-        "branch_percent_before": _totals(old)["branch_percent"],
-        "branch_percent_after": _totals(new)["branch_percent"],
-        "files": files,
-    }
+def _print_diff(result: dict[str, Any]) -> None:
+    print(f"{result['older']} -> {result['newer']}")
+    print(f"lines: {result['line_percent_before']:.2f}% -> {result['line_percent_after']:.2f}%")
+    if result["branch_percent_before"] is not None and result["branch_percent_after"] is not None:
+        print(f"branches: {result['branch_percent_before']:.2f}% -> {result['branch_percent_after']:.2f}%")
+    for path, item in result["files"].items():
+        print(path)
+        if item.get("source_changed"):
+            print("  source changed: obligation-level comparison unavailable")
+            continue
+        if item["newly_covered_lines"]:
+            print(f"  + covered lines {item['newly_covered_lines']}")
+        if item["newly_uncovered_lines"]:
+            print(f"  - uncovered lines {item['newly_uncovered_lines']}")
+        if item["newly_covered_branches"]:
+            print(f"  + covered branches {item['newly_covered_branches']}")
+        if item["newly_uncovered_branches"]:
+            print(f"  - uncovered branches {item['newly_uncovered_branches']}")
+
+
+def _print_next(result: dict[str, Any]) -> None:
+    if result["status"] == "blocked":
+        if result["reason"] == "suite-failed":
+            print("latest run failed")
+            print("coverage may be partial")
+            print("no next coverage target selected")
+        elif result["reason"] == "stale-run":
+            print("latest run is stale for the remaining uncovered candidates")
+            print("rerun:")
+            print("    covledger run -- pytest -q")
+        else:
+            print(f"next blocked: {result['reason']}")
+        return
+    candidate = result.get("candidate")
+    if candidate is None:
+        print("No unresolved coverage candidate.")
+        return
+    print(f"{candidate['path']}:{candidate['line']}")
+    print()
+    if candidate["gap"]["kind"] == "error-path":
+        print(f"{candidate['gap']['label']}:")
+    else:
+        print(f"{candidate['gap']['kind']}: {candidate['gap']['label']}")
+    if candidate.get("function"):
+        print()
+        print("function:")
+        print(f"    {candidate['function']['qualname']}")
+    findings = candidate["deterministic"]["findings"]
+    print()
+    print("deterministic findings:")
+    if findings:
+        for finding in findings:
+            print(f"    {finding}")
+    else:
+        print("    none")
+    print()
+    print("semantic findings:")
+    judgments = candidate["semantic"]["judgments"]
+    if judgments:
+        for rule, probability in sorted(judgments.items()):
+            print(f"    {rule:<24} {float(probability):.2f}")
+    else:
+        print("    none cached")
+    print()
+    print("suggested action:")
+    print(f"    {candidate['suggested_action']}")
+    print()
+    print("why:")
+    for reason in candidate["why"]:
+        print(f"    {reason}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +215,10 @@ def build_parser() -> argparse.ArgumentParser:
     quality.add_argument("--refresh", action="store_true")
     quality.add_argument("--max-functions", type=int)
     quality.add_argument("--json", action="store_true", dest="json_output")
+
+    next_parser = sub.add_parser("next", help="select the next uncovered behavior to inspect")
+    next_parser.add_argument("selector", nargs="?", default="latest")
+    next_parser.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -163,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
                 _json(report)
             else:
                 _print_summary(report)
-            return int(report["exit_code"] != 0)
+            return int(report["exit_code"])
 
         if args.command_name == "runs":
             if args.selector is None:
@@ -181,47 +254,37 @@ def main(argv: list[str] | None = None) -> int:
                     _print_summary(run)
                 return 0
             if args.action == "gaps":
+                result = {"run_id": run["run_id"], "gaps": _gaps(root, run, args.limit)}
                 if args.json_output:
-                    _json({"run_id": run["run_id"], "gaps": dict(_gaps(run, args.limit))})
+                    _json(result)
                 else:
-                    _print_gaps(run, args.limit)
+                    _print_gaps(root, run, args.limit)
                 return 0
-            if args.action == "file":
-                if not args.path:
-                    raise ValueError("runs <selector> file requires a path")
-                if args.json_output:
-                    item = run["coverage"]["files"].get(args.path)
-                    if item is None:
-                        raise ValueError(f"file not measured in run: {args.path}")
-                    _json({"run_id": run["run_id"], "path": args.path, "coverage": item})
-                else:
-                    _print_file(root, args.selector, run, args.path)
-                return 0
-
-        if args.command_name == "diff":
-            result = _diff(load_run(root, args.older), load_run(root, args.newer))
+            if not args.path:
+                raise ValueError("runs <selector> file requires a path")
+            result = _file_result(root, run, args.path)
             if args.json_output:
                 _json(result)
             else:
-                print(f"{result['older']} -> {result['newer']}")
-                print(f"lines: {result['line_percent_before']:.2f}% -> {result['line_percent_after']:.2f}%")
-                print(f"branches: {result['branch_percent_before']:.2f}% -> {result['branch_percent_after']:.2f}%")
-                for path, item in result["files"].items():
-                    print(path)
-                    if item["newly_covered_lines"]:
-                        print(f"  + covered lines {item['newly_covered_lines']}")
-                    if item["newly_uncovered_lines"]:
-                        print(f"  - uncovered lines {item['newly_uncovered_lines']}")
-                    if item["newly_covered_branches"]:
-                        print(f"  + covered branches {item['newly_covered_branches']}")
-                    if item["newly_uncovered_branches"]:
-                        print(f"  - uncovered branches {item['newly_uncovered_branches']}")
+                _print_file(root, run, args.path)
+            return 0
+
+        if args.command_name == "diff":
+            result = diff_runs(load_run(root, args.older), load_run(root, args.newer))
+            if args.json_output:
+                _json(result)
+            else:
+                _print_diff(result)
             return 0
 
         if args.command_name == "quality":
             if not 0.0 <= args.threshold <= 1.0:
                 raise ValueError("threshold must be between 0 and 1")
-            target = (root / args.target).resolve() if not Path(args.target).is_absolute() else Path(args.target).resolve()
+            target = (
+                (root / args.target).resolve()
+                if not Path(args.target).is_absolute()
+                else Path(args.target).resolve()
+            )
             report = quality_report(
                 target,
                 root=root,
@@ -235,22 +298,27 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"functions: {report['function_count']}")
                 for item in report["functions"]:
-                    exact = item["exact_findings"]
-                    semantic_findings = item.get("semantic_findings", [])
-                    if not exact and not semantic_findings:
+                    if not item["exact_findings"] and not item.get("semantic_findings", []):
                         continue
                     print(f"{item['path']}:{item['line']}  {item['qualname']}")
-                    for finding in exact:
+                    for finding in item["exact_findings"]:
                         print(f"  exact     {finding}")
                     semantic = item.get("semantic", {}).get("judgments", {})
-                    for finding in semantic_findings:
+                    for finding in item.get("semantic_findings", []):
                         print(f"  semantic  {semantic[finding]:.2f}  {finding}")
             return 0
 
+        if args.command_name == "next":
+            result = next_query(root, args.selector)
+            if args.json_output:
+                _json(result)
+            else:
+                _print_next(result)
+            return 0
     except (RunNotFound, UnsupportedCommand, FileNotFoundError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except Exception as exc:  # PyJev/network errors are surfaced without hiding their cause.
+    except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 2

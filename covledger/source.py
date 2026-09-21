@@ -1,31 +1,37 @@
-"""Python source discovery and deterministic AST facts."""
+"""Python source discovery, exact AST facts, and source regions."""
 
 from __future__ import annotations
 
 import ast
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 SKIP_DIRS = frozenset(
     {
-        ".git",
-        ".hg",
-        ".svn",
-        ".venv",
-        "venv",
-        "__pycache__",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".mypy_cache",
-        ".tox",
-        ".nox",
-        ".covledger",
-        "build",
-        "dist",
-        "node_modules",
+        ".git", ".hg", ".svn", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache",
+        ".mypy_cache", ".tox", ".nox", ".covledger", ".ledger", "build", "dist", "node_modules",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRegion:
+    kind: str
+    line: int
+    end_line: int
+    label: str
+    function: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "line": self.line,
+            "end_line": self.end_line,
+            "label": self.label,
+            "function": self.function,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +46,38 @@ class FunctionFacts:
     max_nesting: int
     return_count: int
     decision_count: int
-    bare_except: bool
-    broad_except: bool
-    mutable_default: bool
-    eval_exec_calls: tuple[str, ...]
+    bare_except_lines: tuple[int, ...]
+    broad_excepts: tuple[dict[str, Any], ...]
+    mutable_defaults: tuple[dict[str, Any], ...]
+    eval_exec_call_details: tuple[dict[str, Any], ...]
+    is_async: bool
+    await_count: int
+    yield_count: int
+    yield_from_count: int
+    async_for_count: int
+    async_with_count: int
+    raise_count: int
+    assert_count: int
+    calls: tuple[dict[str, Any], ...]
+    imports: tuple[dict[str, Any], ...]
+    global_names: tuple[str, ...]
+    nonlocal_names: tuple[str, ...]
+
+    @property
+    def bare_except(self) -> bool:
+        return bool(self.bare_except_lines)
+
+    @property
+    def broad_except(self) -> bool:
+        return bool(self.broad_excepts)
+
+    @property
+    def mutable_default(self) -> bool:
+        return bool(self.mutable_defaults)
+
+    @property
+    def eval_exec_calls(self) -> tuple[str, ...]:
+        return tuple(item["name"] for item in self.eval_exec_call_details)
 
     @property
     def exact_findings(self) -> tuple[str, ...]:
@@ -68,6 +102,32 @@ class FunctionFacts:
             findings.append("dynamic-code-execution")
         return tuple(findings)
 
+    def facts(self) -> dict[str, Any]:
+        return {
+            "line_count": self.line_count,
+            "parameter_count": self.parameter_count,
+            "max_nesting": self.max_nesting,
+            "return_count": self.return_count,
+            "decision_count": self.decision_count,
+            "is_async": self.is_async,
+            "await_count": self.await_count,
+            "yield_count": self.yield_count,
+            "yield_from_count": self.yield_from_count,
+            "async_for_count": self.async_for_count,
+            "async_with_count": self.async_with_count,
+            "bare_except_lines": list(self.bare_except_lines),
+            "broad_excepts": list(self.broad_excepts),
+            "mutable_defaults": list(self.mutable_defaults),
+            "eval_exec_calls": list(self.eval_exec_call_details),
+            "raise_count": self.raise_count,
+            "assert_count": self.assert_count,
+            "call_count": len(self.calls),
+            "calls": list(self.calls),
+            "imports": list(self.imports),
+            "global_names": list(self.global_names),
+            "nonlocal_names": list(self.nonlocal_names),
+        }
+
 
 def discover_python_files(target: Path) -> list[Path]:
     target = target.resolve()
@@ -77,17 +137,41 @@ def discover_python_files(target: Path) -> list[Path]:
         if target.suffix != ".py":
             raise ValueError(f"target file is not Python: {target}")
         return [target]
-
     files: list[Path] = []
     for path in target.rglob("*.py"):
         relative = path.relative_to(target)
         if any(part in SKIP_DIRS for part in relative.parts[:-1]):
             continue
-        # Product-quality mode intentionally ignores conventional tests by default.
         if relative.parts and (relative.parts[0] == "tests" or path.name.startswith("test_")):
             continue
         files.append(path)
     return sorted(files, key=lambda path: path.as_posix())
+
+
+def _call_name(node: ast.Call) -> str:
+    value: ast.AST = node.func
+    parts: list[str] = []
+    while isinstance(value, ast.Attribute):
+        parts.append(value.attr)
+        value = value.value
+    if isinstance(value, ast.Name):
+        parts.append(value.id)
+    return ".".join(reversed(parts)) if parts else ast.unparse(node.func)
+
+
+def _import_rows(node: ast.Import | ast.ImportFrom) -> list[dict[str, Any]]:
+    if isinstance(node, ast.Import):
+        return [{"line": node.lineno, "module": alias.name} for alias in node.names]
+    return [
+        {"line": node.lineno, "module": node.module or "", "name": alias.name}
+        for alias in node.names
+    ]
+
+
+def _except_label(node: ast.ExceptHandler) -> str:
+    if node.type is None:
+        return "except"
+    return f"except {ast.unparse(node.type)}"
 
 
 class _MetricVisitor(ast.NodeVisitor):
@@ -96,9 +180,20 @@ class _MetricVisitor(ast.NodeVisitor):
         self.max_depth = 0
         self.return_count = 0
         self.decision_count = 0
-        self.bare_except = False
-        self.broad_except = False
-        self.eval_exec: set[str] = set()
+        self.bare_except_lines: list[int] = []
+        self.broad_excepts: list[dict[str, Any]] = []
+        self.eval_exec_calls: list[dict[str, Any]] = []
+        self.await_count = 0
+        self.yield_count = 0
+        self.yield_from_count = 0
+        self.async_for_count = 0
+        self.async_with_count = 0
+        self.raise_count = 0
+        self.assert_count = 0
+        self.calls: list[dict[str, Any]] = []
+        self.imports: list[dict[str, Any]] = []
+        self.global_names: list[str] = []
+        self.nonlocal_names: list[str] = []
 
     def _nested(self, node: ast.AST) -> None:
         self.depth += 1
@@ -114,7 +209,9 @@ class _MetricVisitor(ast.NodeVisitor):
         self.decision_count += 1
         self._nested(node)
 
-    visit_AsyncFor = visit_For
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.async_for_count += 1
+        self.visit_For(node)
 
     def visit_While(self, node: ast.While) -> None:
         self.decision_count += 1
@@ -126,7 +223,9 @@ class _MetricVisitor(ast.NodeVisitor):
     def visit_With(self, node: ast.With) -> None:
         self._nested(node)
 
-    visit_AsyncWith = visit_With
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.async_with_count += 1
+        self.visit_With(node)
 
     def visit_Match(self, node: ast.Match) -> None:
         self.decision_count += len(node.cases)
@@ -144,20 +243,54 @@ class _MetricVisitor(ast.NodeVisitor):
         self.return_count += 1
         self.generic_visit(node)
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.raise_count += 1
+        self.generic_visit(node)
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self.assert_count += 1
+        self.generic_visit(node)
+
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.type is None:
-            self.bare_except = True
+            self.bare_except_lines.append(node.lineno)
         elif isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}:
-            self.broad_except = True
+            self.broad_excepts.append({"line": node.lineno, "caught": node.type.id})
         self._nested(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        name = _call_name(node)
+        row = {"line": node.lineno, "name": name}
+        self.calls.append(row)
         if isinstance(node.func, ast.Name) and node.func.id in {"eval", "exec"}:
-            self.eval_exec.add(node.func.id)
+            self.eval_exec_calls.append(row)
         self.generic_visit(node)
 
-    # Nested definitions are separate units; their internals must not inflate
-    # the enclosing function's metrics.
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.extend(_import_rows(node))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.imports.extend(_import_rows(node))
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.global_names.extend(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocal_names.extend(node.names)
+
+    def visit_Await(self, node: ast.Await) -> None:
+        self.await_count += 1
+        self.generic_visit(node)
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        self.yield_count += 1
+        self.generic_visit(node)
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
+        self.yield_count += 1
+        self.yield_from_count += 1
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         return None
 
@@ -172,8 +305,7 @@ class _MetricVisitor(ast.NodeVisitor):
 
 
 class _FunctionCollector(ast.NodeVisitor):
-    def __init__(self, path: Path, source: str, display_path: str) -> None:
-        self.path = path
+    def __init__(self, source: str, display_path: str) -> None:
         self.source_lines = source.splitlines(keepends=True)
         self.display_path = display_path
         self.scope: list[str] = []
@@ -197,8 +329,19 @@ class _FunctionCollector(ast.NodeVisitor):
         args = node.args
         parameter_count = len(args.posonlyargs) + len(args.args) + len(args.kwonlyargs)
         parameter_count += int(args.vararg is not None) + int(args.kwarg is not None)
-        defaults: Iterable[ast.expr] = [*args.defaults, *(value for value in args.kw_defaults if value is not None)]
-        mutable_default = any(isinstance(value, (ast.List, ast.Dict, ast.Set)) for value in defaults)
+        positional = [*args.posonlyargs, *args.args]
+        positional_defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        mutable_defaults: list[dict[str, Any]] = []
+        for arg, default in zip(positional, positional_defaults, strict=True):
+            if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                mutable_defaults.append(
+                    {"parameter": arg.arg, "line": default.lineno, "expression": ast.unparse(default)}
+                )
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+            if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                mutable_defaults.append(
+                    {"parameter": arg.arg, "line": default.lineno, "expression": ast.unparse(default)}
+                )
         self.functions.append(
             FunctionFacts(
                 path=self.display_path,
@@ -211,10 +354,22 @@ class _FunctionCollector(ast.NodeVisitor):
                 max_nesting=metrics.max_depth,
                 return_count=metrics.return_count,
                 decision_count=metrics.decision_count,
-                bare_except=metrics.bare_except,
-                broad_except=metrics.broad_except,
-                mutable_default=mutable_default,
-                eval_exec_calls=tuple(sorted(metrics.eval_exec)),
+                bare_except_lines=tuple(sorted(metrics.bare_except_lines)),
+                broad_excepts=tuple(metrics.broad_excepts),
+                mutable_defaults=tuple(mutable_defaults),
+                eval_exec_call_details=tuple(metrics.eval_exec_calls),
+                is_async=isinstance(node, ast.AsyncFunctionDef),
+                await_count=metrics.await_count,
+                yield_count=metrics.yield_count,
+                yield_from_count=metrics.yield_from_count,
+                async_for_count=metrics.async_for_count,
+                async_with_count=metrics.async_with_count,
+                raise_count=metrics.raise_count,
+                assert_count=metrics.assert_count,
+                calls=tuple(metrics.calls),
+                imports=tuple(metrics.imports),
+                global_names=tuple(sorted(set(metrics.global_names))),
+                nonlocal_names=tuple(sorted(set(metrics.nonlocal_names))),
             )
         )
         for child in node.body:
@@ -232,7 +387,81 @@ def extract_functions(path: Path, *, root: Path | None = None) -> list[FunctionF
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     display_path = path.resolve().relative_to(root.resolve()).as_posix() if root else path.as_posix()
-    collector = _FunctionCollector(path, source, display_path)
+    collector = _FunctionCollector(source, display_path)
     for node in tree.body:
         collector.visit(node)
     return collector.functions
+
+
+def index_regions(source: str) -> list[SourceRegion]:
+    tree = ast.parse(source)
+    regions: list[SourceRegion] = []
+
+    def walk(node: ast.AST, function: str | None) -> None:
+        current_function = function
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            current_function = node.name
+            regions.append(
+                SourceRegion(
+                    "function",
+                    node.lineno,
+                    node.end_lineno or node.lineno,
+                    node.name,
+                    current_function,
+                )
+            )
+        kinds = {
+            ast.If: "if",
+            ast.For: "for",
+            ast.AsyncFor: "async-for",
+            ast.While: "while",
+            ast.Try: "try",
+            ast.With: "with",
+            ast.AsyncWith: "async-with",
+            ast.Match: "match",
+            ast.Raise: "raise",
+            ast.Return: "return",
+        }
+        for cls, kind in kinds.items():
+            if isinstance(node, cls):
+                line = node.lineno
+                regions.append(
+                    SourceRegion(kind, line, node.end_lineno or line, kind, current_function)
+                )
+                break
+        if isinstance(node, ast.ExceptHandler):
+            line = node.lineno
+            regions.append(SourceRegion("except", line, node.end_lineno or line, _except_label(node), current_function))
+        if isinstance(node, ast.match_case):
+            line = getattr(node.pattern, "lineno", 0) or 0
+            if line:
+                regions.append(
+                    SourceRegion(
+                        "match-case",
+                        line,
+                        getattr(node, "end_lineno", line) or line,
+                        "match case",
+                        current_function,
+                    )
+                )
+        for child in ast.iter_child_nodes(node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and child in node.decorator_list:
+                continue
+            walk(child, current_function)
+
+    walk(tree, None)
+    return sorted(regions, key=lambda item: (item.line, item.end_line, item.kind, item.label))
+
+
+def source_sha256(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def extract_source_index(path: Path, *, root: Path | None = None) -> dict[str, Any]:
+    source = path.read_text(encoding="utf-8")
+    return {
+        "path": path.resolve().relative_to(root.resolve()).as_posix() if root else path.as_posix(),
+        "source_sha256": source_sha256(source),
+        "regions": [region.to_dict() for region in index_regions(source)],
+        "functions": extract_functions(path, root=root),
+    }

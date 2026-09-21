@@ -16,7 +16,7 @@ allow_dirty_worktree = true
 # Changelog build defaults.
 
 [changelog]
-output = "CHANGELOG.md"
+output = "docs/changelog.md"
 header = ""
 body = """## {% if release.date %}[{{ release.version }}] - {{ release.date }}{% else %}[{{ release.version }}] - Unreleased{% endif %}
 

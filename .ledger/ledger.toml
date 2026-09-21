@@ -22,3 +22,9 @@ storage = "project"
 
 [ledgers.releaseledger.mounts.indexes]
 storage = "cache"
+
+[ledgers.covledger.mounts.runs]
+storage = "project"
+
+[ledgers.covledger.mounts.cache]
+storage = "project"

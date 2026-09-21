@@ -1,4 +1,4 @@
-"""Normalize Coverage.py JSON into CovLedger's small public evidence contract."""
+"""Normalize Coverage.py output and create source-scoped evidence."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import shutil
 from pathlib import Path
 from typing import Any
+
+from ledgercore import ensure_inside_base, relative_to_base
 
 from .model import CoverageFile
 
@@ -19,31 +21,62 @@ def _sha256(path: Path) -> str | None:
 
 
 def _safe_project_path(root: Path, raw_path: str) -> Path | None:
-    candidate = (root / raw_path).resolve()
-    root = root.resolve()
-    if candidate == root or root in candidate.parents:
-        return candidate
-    return None
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return ensure_inside_base(root.resolve(), candidate.resolve(), field_name="coverage source path")
+    except Exception:
+        return None
 
 
-def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> dict[str, Any]:
-    raw = json.loads(raw_json.read_text(encoding="utf-8"))
+def _backend() -> dict[str, Any]:
+    try:
+        import coverage
+
+        version = getattr(coverage, "__version__", None)
+    except ImportError:
+        version = None
+    return {"name": "coverage.py", "version": version, "branch": True}
+
+
+def unavailable_coverage(error: BaseException) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "status": "unavailable",
+        "backend": _backend(),
+        "error": {"type": type(error).__name__, "message": str(error)},
+        "totals": None,
+        "files": {},
+    }
+
+
+def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        raw = json.loads(raw_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return unavailable_coverage(exc), {"schema_version": 1, "files": {}}
     files: dict[str, dict[str, Any]] = {}
+    scope_files: dict[str, dict[str, Any]] = {}
     source_root = run_dir / "sources"
 
     for raw_path, item in sorted(raw.get("files", {}).items()):
         summary = item.get("summary", {})
         source_path = _safe_project_path(project_root, raw_path)
         if source_path is not None:
-            display_path = source_path.relative_to(project_root.resolve()).as_posix()
+            display_path = relative_to_base(project_root.resolve(), source_path)
         else:
             display_path = Path(raw_path).as_posix()
         source_hash = _sha256(source_path) if source_path and source_path.is_file() else None
-        if source_path and source_path.is_file():
+        if source_path and source_path.is_file() and source_hash:
             snapshot = source_root / display_path
             snapshot.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, snapshot)
-
+            scope_files[display_path] = {
+                "language": "python",
+                "sha256": source_hash,
+                "snapshot": f"sources/{display_path}",
+            }
         evidence = CoverageFile(
             path=display_path,
             source_sha256=source_hash,
@@ -61,10 +94,13 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
     covered_lines = int(totals.get("covered_lines", 0))
     branches = int(totals.get("num_branches", 0))
     covered_branches = int(totals.get("covered_branches", 0))
-    return {
-        "backend": "coverage.py",
-        "backend_version": raw.get("meta", {}).get("version"),
-        "branch_coverage": bool(raw.get("meta", {}).get("branch_coverage", False)),
+    coverage = {
+        "schema_version": 2,
+        "status": "available",
+        "backend": _backend() | {
+            "version": raw.get("meta", {}).get("version"),
+            "branch": bool(raw.get("meta", {}).get("branch_coverage", False)),
+        },
         "totals": {
             "statements": statements,
             "covered_lines": covered_lines,
@@ -77,3 +113,4 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
         },
         "files": files,
     }
+    return coverage, {"schema_version": 1, "files": scope_files}

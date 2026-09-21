@@ -1,0 +1,11 @@
+config_version = 1
+
+[ledger]
+code = "cov"
+name = "covledger"
+
+[coverage]
+branch = true
+
+[quality]
+semantic_threshold = 0.70
