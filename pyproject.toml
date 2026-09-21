@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "covledger"
+dynamic = ["version"]
+description = "Python test evidence and code-quality signals for coding agents."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Ledgerwerk" }]
+keywords = ["coverage", "testing", "agents", "python", "jev"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+  "coverage>=7.10,<8",
+  "pyjev>=0.1,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9,<10",
+  "ruff>=0.16,<1",
+  "build>=1,<2",
+]
+
+[project.scripts]
+covledger = "covledger.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ledgerwerk/covledger"
+Issues = "https://github.com/ledgerwerk/covledger/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["covledger*"]
+
+[tool.setuptools.package-data]
+covledger = ["py.typed", "quality_rules.toml"]
+
+[tool.setuptools_scm]
+version_file = "covledger/_version.py"
+fallback_version = "0.0.0"
+parentdir_prefix_version = "covledger-"
+local_scheme = "no-local-version"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

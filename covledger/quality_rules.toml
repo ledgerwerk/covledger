@@ -1,0 +1,34 @@
+[decision.covledger-quality]
+type = "bundle"
+
+[decision.covledger-quality.questions.hidden-side-effect]
+type = "noul"
+question = "This Python function has a meaningful side effect that is not obvious from its name, parameters, or return contract."
+
+[decision.covledger-quality.questions.too-many-jobs]
+type = "noul"
+question = "This Python function performs too many conceptually distinct jobs that should be changeable independently."
+
+[decision.covledger-quality.questions.surprising-mutation]
+type = "noul"
+question = "This Python function mutates caller-owned data or shared state in a surprising way."
+
+[decision.covledger-quality.questions.implicit-global-state]
+type = "noul"
+question = "This Python function materially depends on implicit global, process, environment, or ambient state."
+
+[decision.covledger-quality.questions.hidden-io]
+type = "noul"
+question = "This Python function hides network, filesystem, subprocess, database, or other I/O behind an interface that looks like local computation."
+
+[decision.covledger-quality.questions.policy-mechanism-mix]
+type = "noul"
+question = "This Python function mixes domain or business policy with low-level mechanism in a way that makes either concern harder to change."
+
+[decision.covledger-quality.questions.ambiguous-error-contract]
+type = "noul"
+question = "This Python function makes its failure or error behavior materially ambiguous to callers."
+
+[decision.covledger-quality.questions.misleading-name]
+type = "noul"
+question = "This Python function's name materially understates or misrepresents what the function actually does."
