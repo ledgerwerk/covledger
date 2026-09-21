@@ -59,6 +59,8 @@ def load_covledger_config(root: Path) -> dict[str, Any]:
             "ledger": {"code": "cov", "name": "covledger"},
             "coverage": {"branch": True},
             "quality": {"semantic_threshold": 0.70},
+            "analysis": {"include_generated": False, "exclude": ["context_*.unpack.py"]},
+            "priority": {"high": 70, "critical": 85, "campaign_high_count": 3},
         }
     return tomllib.loads(layout.tool_config_path.read_text(encoding="utf-8"))
 
@@ -103,18 +105,21 @@ def resolve_run_id(root: Path, selector: str) -> str:
         if not runs:
             raise RunNotFound("no CovLedger runs found")
         return runs[0]
-    run_id = validate_run_id(selector)
-    path = runs_root(root) / run_id / "run.json"
-    if not path.is_file():
+    if len(selector) < 8:
+        raise RunNotFound("run selector prefix must be at least 8 characters")
+    matches = [run_id for run_id in list_run_ids(root) if run_id.startswith(selector)]
+    if not matches:
         raise RunNotFound(f"run not found: {selector}")
-    return run_id
+    if len(matches) > 1:
+        raise RunNotFound(f"ambiguous run prefix: {selector} ({', '.join(matches)})")
+    return matches[0]
 
 
 def _load_run_artifacts(run_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
     if "coverage" in metadata:
         return metadata
     result = dict(metadata)
-    for name in ("scope", "coverage", "quality"):
+    for name in ("scope", "coverage", "quality", "assessment"):
         path = run_dir / f"{name}.json"
         if path.is_file():
             result[name] = load_json_object(path, label=f"{name} artifact")

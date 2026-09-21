@@ -14,6 +14,7 @@ import coverage
 from ledgercore import write_json
 
 from . import __version__
+from .assessment import build_assessment
 from .coverage_data import normalize_coverage, unavailable_coverage
 from .quality import quality_document_from_sources
 from .storage import new_run_id, publish_staged_run, stage_run
@@ -126,16 +127,22 @@ def run_pytest(root: Path, command: list[str]) -> dict[str, Any]:
             "scope": "scope.json",
             "coverage": "coverage.json",
             "quality": "quality.json",
+            "assessment": "assessment.json",
             "sources": "sources",
         },
     }
+    evidence = dict(metadata)
+    evidence.update({"coverage": coverage_data, "quality": quality})
+    assessment = build_assessment(root, evidence, stage)
     write_json(stage / "scope.json", scope)
     write_json(stage / "coverage.json", coverage_data)
     write_json(stage / "quality.json", quality)
+    write_json(stage / "assessment.json", assessment)
     write_json(stage / "run.json", metadata)
     published = publish_staged_run(stage, run_id)
     result = dict(metadata)
     result.update({"scope": scope, "coverage": coverage_data, "quality": quality})
+    result["assessment"] = assessment
     result.update(
         {
             "suite_passed": metadata["suite"]["passed"],

@@ -1,109 +1,90 @@
-"""Deterministic selection of the next uncovered behavior to inspect."""
+"""Select the next actionable hotspot from the shared assessment model."""
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any
 
-from .gaps import GapCandidate, gaps_for_run
-from .quality import read_semantic_cache
-from .storage import load_run, resolve_run_id, runs_root
+from .assessment import assessment_for_run
+from .storage import load_run
 
 GAP_ORDER = {"error-path": 0, "branch": 1, "line": 2}
-HIGH_SIGNAL = {"bare-except", "broad-except", "dynamic-code-execution", "mutable-default"}
-STRUCTURAL = {"deep-nesting", "many-decisions", "long-function", "many-return-paths", "long-parameter-list"}
 
 
-def _sha256(path: Path) -> str | None:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
+def _gap_id(row: dict[str, Any]) -> str | None:
+    return row.get("gap_id") or row.get("gap", {}).get("gap_id")
 
 
-def _quality_row(run: dict[str, Any], candidate: GapCandidate) -> dict[str, Any] | None:
-    quality_file = run.get("quality", {}).get("files", {}).get(candidate.path, {})
-    functions = quality_file.get("functions", [])
-    if candidate.function is None:
-        return None
-    for row in functions:
-        if row.get("qualname") == candidate.function.get("qualname"):
-            return row
-    return None
-
-
-def _fresh(root: Path, run: dict[str, Any], candidate: GapCandidate) -> str:
-    current = (root / candidate.path).resolve()
-    if not current.is_file():
-        return "missing"
-    expected = run.get("coverage", {}).get("files", {}).get(candidate.path, {}).get("source_sha256")
-    return "fresh" if expected and _sha256(current) == expected else "changed"
-
-
-def _candidate_payload(root: Path, run: dict[str, Any], candidate: GapCandidate) -> dict[str, Any]:
-    row = _quality_row(run, candidate)
-    facts = row.get("facts", {}) if row else {}
-    finding_rows = row.get("findings", []) if row else []
-    findings = [item.get("id") for item in finding_rows if item.get("id")]
-    semantic_payload = None
-    if row and row.get("semantic_cache_key"):
-        semantic_payload = read_semantic_cache(root, row["semantic_cache_key"])
-    judgments = semantic_payload.get("judgments", {}) if semantic_payload else {}
-    high_signal = bool(set(findings) & HIGH_SIGNAL)
-    structural_count = len(set(findings) & STRUCTURAL)
-    strongest_semantic = max((float(value) for value in judgments.values()), default=0.0)
-    payload: dict[str, Any] = {
-        "path": candidate.path,
-        "line": candidate.line,
-        "gap": {
-            "kind": candidate.kind,
-            "label": candidate.label,
-            **({"from_line": candidate.from_line} if candidate.from_line is not None else {}),
-            **({"to_line": candidate.to_line} if candidate.to_line is not None else {}),
+def _candidate(assessment: dict[str, Any], hotspot: dict[str, Any], gap: dict[str, Any]) -> dict[str, Any]:
+    gap_data = gap["gap"]
+    finding_ids = hotspot.get("finding_ids", [])
+    return {
+        "function_id": hotspot["id"],
+        "gap_id": _gap_id(gap),
+        "path": hotspot["path"],
+        "line": gap["line"],
+        "gap": gap_data,
+        "function": {
+            "qualname": hotspot["qualname"],
+            "line": hotspot["line"],
+            "end_line": hotspot["end_line"],
         },
-        "function": candidate.function,
-        "deterministic": {"facts": facts, "findings": sorted(set(findings))},
-        "semantic": {"source": "cache" if semantic_payload else "none", "judgments": judgments},
+        "priority_score": hotspot["score"]["priority"],
+        "band": hotspot["score"]["band"],
+        "score_breakdown": hotspot["score"],
+        "deterministic": {"facts": hotspot["facts"], "finding_ids": finding_ids},
+        "semantic": {"source": "none", "score": None, "judgments": {}},
         "suggested_action": {
             "error-path": "inspect this uncovered error path",
             "branch": "inspect this uncovered branch",
             "line": "inspect this uncovered line",
-        }[candidate.kind],
-        "why": ["uncovered behavior"] + (["high-risk function"] if high_signal or structural_count else []),
-        "current_source": _fresh(root, run, candidate),
-        "_rank": (
-            GAP_ORDER[candidate.kind],
-            0 if high_signal else 1,
-            -structural_count,
-            -strongest_semantic,
-            candidate.path,
-            candidate.line,
-        ),
+        }[gap_data["kind"]],
+        "why": [
+            "uncovered behavior",
+            f"priority score {hotspot['score']['priority']}",
+        ] + (["deterministic findings"] if finding_ids else []),
+        "current_source": hotspot["current_source"],
+        "repository_context": {
+            "work_mode": assessment["summary"]["work_mode"],
+            "counts": assessment["summary"]["counts"],
+        },
     }
-    return payload
 
 
 def next_query(root: Path, selector: str = "latest") -> dict[str, Any]:
-    run_id = resolve_run_id(root, selector)
-    run = load_run(root, run_id)
-    base = {"schema_version": 1, "run_id": run_id}
+    run = load_run(root, selector)
+    run_id = run["run_id"]
+    base = {"schema_version": 2, "run_id": run_id}
     suite_passed = run.get("suite_passed", run.get("suite", {}).get("passed", False))
     if not suite_passed:
         return {**base, "status": "blocked", "reason": "suite-failed"}
     if run.get("coverage", {}).get("status") != "available":
         return {**base, "status": "blocked", "reason": "coverage-unavailable"}
-
-    run_dir = runs_root(root) / run_id
-    candidates = gaps_for_run(run, run_dir)
-    payloads = [_candidate_payload(root, run, candidate) for candidate in candidates]
-    fresh = [item for item in payloads if item["current_source"] == "fresh"]
-    if not fresh:
-        if payloads:
+    assessment = assessment_for_run(root, run)
+    gaps_by_id = {_gap_id(row): row for row in assessment["gaps"] if _gap_id(row)}
+    candidates: list[dict[str, Any]] = []
+    for hotspot in assessment["hotspots"]:
+        if hotspot["current_source"] != "fresh":
+            continue
+        gaps = [gaps_by_id[gap_id] for gap_id in hotspot.get("gap_ids", []) if gap_id in gaps_by_id]
+        if not gaps:
+            continue
+        gap = min(gaps, key=lambda row: (GAP_ORDER[row["gap"]["kind"]], row["line"], row["path"]))
+        candidates.append(_candidate(assessment, hotspot, gap))
+    if not candidates:
+        if assessment["summary"]["functions_with_gaps"]:
             return {**base, "status": "blocked", "reason": "stale-run"}
-        return {**base, "status": "ok", "candidate": None}
-    selected = min(fresh, key=lambda item: item.pop("_rank"))
-    return {**base, "status": "ok", "candidate": selected}
+        return {**base, "status": "ok", "candidate": None, "repository_context": assessment["summary"]}
+    selected = min(
+        candidates,
+        key=lambda item: (
+            -item["priority_score"],
+            item["path"],
+            item["line"],
+            item["function_id"],
+        ),
+    )
+    return {**base, "status": "ok", "candidate": selected, "repository_context": assessment["summary"]}
 
 
 __all__ = ["next_query"]

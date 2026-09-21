@@ -9,3 +9,14 @@ branch = true
 
 [quality]
 semantic_threshold = 0.70
+
+[analysis]
+include_generated = false
+exclude = [
+  "context_*.unpack.py",
+]
+
+[priority]
+high = 70
+critical = 85
+campaign_high_count = 3

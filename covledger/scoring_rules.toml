@@ -1,0 +1,61 @@
+schema_version = 1
+name = "covledger-priority"
+version = 1
+
+[hazard]
+bare-except = 0.55
+broad-except = 0.35
+dynamic-code-execution = 0.65
+mutable-default = 0.25
+
+[structure.lines]
+start = 50
+severe = 150
+weight = 0.30
+
+[structure.decisions]
+start = 10
+severe = 30
+weight = 0.25
+
+[structure.nesting]
+start = 4
+severe = 8
+weight = 0.20
+
+[structure.returns]
+start = 6
+severe = 15
+weight = 0.15
+
+[structure.parameters]
+start = 6
+severe = 12
+weight = 0.10
+
+[quality]
+hazard_weight = 0.55
+structure_weight = 0.45
+
+[exposure]
+gap_error_path = 1.00
+gap_branch = 0.75
+gap_line = 0.45
+gap_weight = 0.45
+line_ratio_weight = 0.30
+branch_ratio_weight = 0.25
+
+[priority.with_history]
+exposure = 0.45
+quality = 0.35
+regression = 0.20
+
+[priority.without_history]
+exposure = 0.56
+quality = 0.44
+
+[bonus]
+error_path_broad_exception = 12
+branch_many_decisions = 8
+dynamic_execution_uncovered = 6
+high_regression_high_quality = 5

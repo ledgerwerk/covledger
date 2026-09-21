@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .identity import gap_id
 from .source import SourceRegion, index_regions
 
 
@@ -18,6 +19,7 @@ class GapCandidate:
     function: dict[str, Any] | None = None
     from_line: int | None = None
     to_line: int | None = None
+    id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         gap: dict[str, Any] = {"kind": self.kind, "label": self.label}
@@ -26,6 +28,8 @@ class GapCandidate:
         if self.to_line is not None:
             gap["to_line"] = self.to_line
         result: dict[str, Any] = {"path": self.path, "line": self.line, "gap": gap}
+        if self.id is not None:
+            result["gap_id"] = self.id
         if self.function is not None:
             result["function"] = self.function
         return result
@@ -95,10 +99,26 @@ def derive_gaps(path: str, coverage_file: dict[str, Any], source: str) -> list[G
                 function=_function_for(functions, line),
             )
         )
-    return sorted(
+    ordered = sorted(
         candidates,
         key=lambda item: (item.line, {"error-path": 0, "branch": 1, "line": 2}[item.kind], item.kind),
     )
+    source_hash = str(coverage_file.get("source_sha256", ""))
+    return [
+        replace(
+            item,
+            id=gap_id(
+                path,
+                source_hash,
+                item.function.get("qualname") if item.function else None,
+                item.kind,
+                item.from_line,
+                item.to_line,
+                item.line,
+            ),
+        )
+        for item in ordered
+    ]
 
 
 def extract_functions_from_source(source: str, path: str) -> list[Any]:

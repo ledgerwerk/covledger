@@ -82,9 +82,11 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
             source_sha256=source_hash,
             statements=int(summary.get("num_statements", 0)),
             covered_lines=int(summary.get("covered_lines", 0)),
+            executed_lines=tuple(int(line) for line in item.get("executed_lines", [])),
             missing_lines=tuple(int(line) for line in item.get("missing_lines", [])),
             branches=int(summary.get("num_branches", 0)),
             covered_branches=int(summary.get("covered_branches", 0)),
+            executed_branches=tuple(tuple(map(int, branch)) for branch in item.get("executed_branches", [])),
             missing_branches=tuple(tuple(map(int, branch)) for branch in item.get("missing_branches", [])),
         )
         files[display_path] = evidence.to_dict()
@@ -92,8 +94,10 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
     totals = raw.get("totals", {})
     statements = int(totals.get("num_statements", 0))
     covered_lines = int(totals.get("covered_lines", 0))
+    executed_lines = tuple(int(line) for line in raw.get("executed_lines", []))
     branches = int(totals.get("num_branches", 0))
     covered_branches = int(totals.get("covered_branches", 0))
+    executed_branches = tuple(tuple(map(int, branch)) for branch in raw.get("executed_branches", []))
     coverage = {
         "schema_version": 2,
         "status": "available",
@@ -104,13 +108,44 @@ def normalize_coverage(raw_json: Path, *, project_root: Path, run_dir: Path) -> 
         "totals": {
             "statements": statements,
             "covered_lines": covered_lines,
+            "executed_lines": list(executed_lines),
             "missing_lines": max(statements - covered_lines, 0),
             "line_percent": 100.0 if statements == 0 else 100.0 * covered_lines / statements,
             "branches": branches,
             "covered_branches": covered_branches,
+            "executed_branches": [list(branch) for branch in executed_branches],
             "missing_branches": max(branches - covered_branches, 0),
             "branch_percent": 100.0 if branches == 0 else 100.0 * covered_branches / branches,
         },
         "files": files,
     }
     return coverage, {"schema_version": 1, "files": scope_files}
+
+
+def function_coverage(function: Any, coverage_file: dict[str, Any]) -> dict[str, Any]:
+    """Intersect positive and missing file obligations with one function region."""
+    start, end = int(function.line), int(function.end_line)
+    executed = {int(line) for line in coverage_file.get("executed_lines", []) if start <= int(line) <= end}
+    missing = {int(line) for line in coverage_file.get("missing_lines", []) if start <= int(line) <= end}
+    executed_branches = {
+        tuple(map(int, branch))
+        for branch in coverage_file.get("executed_branches", [])
+        if start <= int(branch[0]) <= end
+    }
+    missing_branches = {
+        tuple(map(int, branch))
+        for branch in coverage_file.get("missing_branches", [])
+        if start <= int(branch[0]) <= end
+    }
+    statements = len(executed | missing)
+    branches = len(executed_branches | missing_branches)
+    return {
+        "statements": statements,
+        "covered_lines": len(executed),
+        "missing_lines": len(missing),
+        "line_percent": 100.0 if not statements else 100.0 * len(executed) / statements,
+        "branches": branches,
+        "covered_branches": len(executed_branches),
+        "missing_branches": len(missing_branches),
+        "branch_percent": 100.0 if not branches else 100.0 * len(executed_branches) / branches,
+    }

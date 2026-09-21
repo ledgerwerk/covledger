@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
+import tomllib
 from pathlib import Path
 from typing import Any
 
 from ledgercore import dumps_json, load_json_object, write_json
 
+from .identity import finding_id, function_id
+from .scoring import attention_band, augmented_priority, priority_score, rules_sha256, semantic_modifier, semantic_score
 from .source import FunctionFacts, discover_python_files, extract_functions, source_sha256
 from .storage import semantic_cache_path
 
@@ -16,11 +19,25 @@ DEFAULT_THRESHOLD = 0.70
 DECISION = "covledger-quality"
 
 
-def collect_functions(target: Path, *, root: Path) -> list[FunctionFacts]:
+def _analysis_excludes(root: Path) -> tuple[str, ...]:
+    path = root / ".ledger" / "covledger" / "config.toml"
+    if not path.is_file():
+        return ()
+    config = tomllib.loads(path.read_text(encoding="utf-8"))
+    values = config.get("analysis", {}).get("exclude", [])
+    return tuple(str(value) for value in values)
+
+
+
+def collect_functions(
+    target: Path, *, root: Path, include_generated: bool = False
+ ) -> list[FunctionFacts]:
     functions: list[FunctionFacts] = []
-    for path in discover_python_files(target):
+    excludes = _analysis_excludes(root)
+    for path in discover_python_files(target, include_generated=include_generated, excludes=excludes):
         functions.extend(extract_functions(path, root=root))
     return sorted(functions, key=lambda item: (item.path, item.line, item.qualname))
+
 
 
 def facts_dict(item: FunctionFacts) -> dict[str, Any]:
@@ -137,20 +154,37 @@ def semantic_judgments(item: FunctionFacts, *, root: Path, refresh: bool = False
 def _finding_rows(item: FunctionFacts) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     location_by_id = {
-        "bare-except": [{"line": line} for line in item.bare_except_lines],
-        "broad-except": list(item.broad_excepts),
-        "mutable-default": list(item.mutable_defaults),
-        "dynamic-code-execution": list(item.eval_exec_call_details),
+        "bare-except": [
+            {"line": line, "discriminator": f"bare-except#{index}"}
+            for index, line in enumerate(item.bare_except_lines, 1)
+        ],
+        "broad-except": [
+            {**row, "discriminator": f"broad-except#{index}:{row.get('caught', '')}"}
+            for index, row in enumerate(item.broad_excepts, 1)
+        ],
+        "mutable-default": [
+            {**row, "discriminator": f"parameter={row['parameter']}"} for row in item.mutable_defaults
+        ],
+        "dynamic-code-execution": [
+            {**row, "discriminator": f"{row['name']}#{index}"}
+            for index, row in enumerate(item.eval_exec_call_details, 1)
+        ],
     }
     for finding in item.exact_findings:
         locations = location_by_id.get(finding, [])
-        if locations:
-            for location in locations:
-                rows.append({"id": finding, **location})
-        else:
-            rows.append({"id": finding, "line": item.line})
+        if not locations:
+            locations = [{"line": item.line, "discriminator": "function"}]
+        for location in locations:
+            discriminator = str(location["discriminator"])
+            rows.append(
+                {
+                    "id": finding,
+                    "finding_id": finding_id(item.path, item.qualname, "exact", finding, discriminator),
+                    "line": int(location.get("line", item.line)),
+                    **{key: value for key, value in location.items() if key not in {"line", "discriminator"}},
+                }
+            )
     return rows
-
 
 def quality_document_from_sources(
     sources: dict[str, Path],
@@ -171,13 +205,19 @@ def quality_document_from_sources(
         rows: list[dict[str, Any]] = []
         for item in functions:
             key = _semantic_key(item)
+            facts = item.facts() | {"exact_findings": list(item.exact_findings)}
+            breakdown = priority_score(facts)
             row = {
+                "function_id": function_id(item.path, item.qualname),
                 "qualname": item.qualname,
                 "line": item.line,
                 "end_line": item.end_line,
                 "source_sha256": source_sha256(item.source),
-                "facts": item.facts(),
+                "facts": facts,
                 "findings": _finding_rows(item),
+                "quality_score": breakdown.quality,
+                "score_breakdown": breakdown.to_dict(),
+                "attention_band": attention_band(breakdown.quality),
                 "semantic_cache_key": key,
             }
             if semantic:
@@ -186,10 +226,14 @@ def quality_document_from_sources(
                 row["semantic_findings"] = [
                     rule for rule, probability in result["judgments"].items() if float(probability) >= threshold
                 ]
+                row["semantic_score"] = semantic_score(result["judgments"])
+                row["semantic_modifier"] = semantic_modifier(result["judgments"])
+                row["augmented_priority"] = augmented_priority(breakdown.priority, result["judgments"])
             rows.append(row)
         files[display_path] = {"source_sha256": source_sha256(source), "functions": rows}
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "scorer": {"name": "covledger-priority", "version": 1, "rules_sha256": rules_sha256()},
         "analyzer": {"name": "covledger-python-ast", "version": 2},
         "files": files,
     }
@@ -215,15 +259,23 @@ def quality_report(
     threshold: float = DEFAULT_THRESHOLD,
     refresh: bool = False,
     max_functions: int | None = None,
-) -> dict[str, Any]:
-    functions = collect_functions(target, root=root)
+    include_generated: bool = False,
+ ) -> dict[str, Any]:
+    functions = collect_functions(target, root=root, include_generated=include_generated)
     if max_functions is not None:
         functions = functions[:max_functions]
     rows: list[dict[str, Any]] = []
     for function in functions:
+        facts = function.facts() | {"exact_findings": list(function.exact_findings)}
+        breakdown = priority_score(facts)
         row = facts_dict(function)
+        row["function_id"] = function_id(function.path, function.qualname)
+        row["facts"] = facts
         row["source_sha256"] = source_sha256(function.source)
         row["findings"] = _finding_rows(function)
+        row["quality_score"] = breakdown.quality
+        row["score_breakdown"] = breakdown.to_dict()
+        row["attention_band"] = attention_band(breakdown.quality)
         row["semantic_cache_key"] = _semantic_key(function)
         if semantic:
             semantic_result = semantic_judgments(function, root=root, refresh=refresh)
@@ -231,9 +283,13 @@ def quality_report(
             row["semantic_findings"] = [
                 rule for rule, probability in semantic_result["judgments"].items() if float(probability) >= threshold
             ]
+            row["semantic_score"] = semantic_score(semantic_result["judgments"])
+            row["semantic_modifier"] = semantic_modifier(semantic_result["judgments"])
+            row["augmented_priority"] = augmented_priority(breakdown.priority, semantic_result["judgments"])
         rows.append(row)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "scorer": {"name": "covledger-priority", "version": 1, "rules_sha256": rules_sha256()},
         "target": str(target),
         "semantic": semantic,
         "threshold": threshold,

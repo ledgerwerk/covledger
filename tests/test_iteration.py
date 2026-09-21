@@ -15,6 +15,8 @@ def test_missing_except_handler_is_error_path() -> None:
     assert [item.kind for item in candidates] == ["error-path"]
     assert candidates[0].label == "except Exception"
     assert candidates[0].function == {"qualname": "process", "line": 1, "end_line": 5}
+    assert candidates[0].id is not None
+    assert candidates[0].id.startswith("G-")
 
 
 def test_semantic_cache_key_ignores_path_and_start_line(tmp_path: Path) -> None:
@@ -60,7 +62,7 @@ def test_next_blocks_failed_suite(tmp_path: Path) -> None:
     run = run_pytest(tmp_path, ["pytest", "-q"])
     assert run["exit_code"] != 0
     assert next_query(tmp_path) == {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run["run_id"],
         "status": "blocked",
         "reason": "suite-failed",
