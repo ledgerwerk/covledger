@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import importlib.resources
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,18 @@ DEFAULT_THRESHOLD = 0.70
 DECISION = "covledger-quality"
 SEMANTIC_CACHE_SCHEMA = 3
 SEMANTIC_CONTRACT_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticCacheStatus:
+    """Existing content-addressed cache state for one canonical function."""
+
+    cache_key: str
+    result: dict[str, Any] | None
+
+    @property
+    def cached(self) -> bool:
+        return self.result is not None
 
 
 def _effective_threshold(root: Path, threshold: float | None) -> float:
@@ -149,13 +162,21 @@ def read_semantic_cache(root: Path, key: str) -> dict[str, Any] | None:
     return load_json_object(path, label="semantic cache entry")
 
 
+def semantic_cache_status(item: FunctionFacts, *, root: Path) -> SemanticCacheStatus:
+    """Inspect the existing semantic cache without making a PyJev request."""
+    key = semantic_cache_key(item)
+    return SemanticCacheStatus(key, read_semantic_cache(root, key))
+
+
 def semantic_judgments(item: FunctionFacts, *, root: Path, refresh: bool = False) -> dict[str, Any]:
     from pyjev import BundleResult, Jev, NoulResult
 
-    cache_file = semantic_cache_path(root, _semantic_key(item))
+    cache_status = semantic_cache_status(item, root=root)
+    cache_file = semantic_cache_path(root, cache_status.cache_key)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    if cache_file.is_file() and not refresh:
-        return load_json_object(cache_file, label="semantic cache entry")
+    if cache_status.cached and not refresh:
+        assert cache_status.result is not None
+        return cache_status.result
 
     config = _materialized_config(cache_file.parent)
     state = {
@@ -177,7 +198,7 @@ def semantic_judgments(item: FunctionFacts, *, root: Path, refresh: bool = False
         judgments[rule] = float(answer.value)
     payload = {
         "cache_schema": SEMANTIC_CACHE_SCHEMA,
-        "cache_key": _semantic_key(item),
+        "cache_key": cache_status.cache_key,
         "model": result.model,
         "request_id": result.request_id,
         "usage": dict(result.usage),
@@ -340,6 +361,8 @@ __all__ = [
     "facts_dict",
     "quality_document_from_sources",
     "quality_report",
+    "SemanticCacheStatus",
+    "semantic_cache_status",
     "read_semantic_cache",
     "semantic_cache_key",
     "semantic_judgments",

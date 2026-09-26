@@ -172,6 +172,7 @@ def run_pytest(root: Path, command: list[str]) -> dict[str, Any]:
             "schema_version": 1,
             "analysis_id": analysis_id,
             "suite": {
+                "pytest_args": ["pytest", *pytest_args],
                 "passed": completed.returncode == 0,
                 "exit_code": int(completed.returncode),
             },

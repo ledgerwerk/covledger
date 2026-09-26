@@ -64,15 +64,12 @@ def _candidate(
     }
 
 
-def next_query(root: Path) -> dict[str, Any]:
-    """Return a next candidate only from current, source/config-fresh analysis."""
-    analysis = load_fresh_current_analysis(root)
-    base = {"schema_version": 1, "analysis_id": analysis["analysis_id"]}
-    if not analysis.get("suite", {}).get("passed", False):
-        return {**base, "status": "blocked", "reason": "suite-failed"}
-    if analysis.get("coverage", {}).get("status") != "available":
-        return {**base, "status": "blocked", "reason": "coverage-unavailable"}
+def ranked_gap_candidates(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every actionable gap candidate in the deterministic next-query order.
 
+    This enumerator is deliberately independent of semantic judgments so all
+    workflows select targets from the same current deterministic evidence.
+    """
     assessment = analysis.get("assessment")
     if not isinstance(assessment, dict):
         raise ValueError("current CovLedger analysis is missing its assessment")
@@ -86,11 +83,7 @@ def next_query(root: Path) -> dict[str, Any]:
             continue
         gap = min(gaps, key=lambda row: (GAP_ORDER[row["gap"]["kind"]], row["line"], row["path"]))
         candidates.append(_candidate(assessment, analysis, hotspot, gap))
-    if not candidates:
-        if assessment.get("summary", {}).get("functions_with_gaps"):
-            return {**base, "status": "blocked", "reason": "stale-analysis"}
-        return {**base, "status": "ok", "candidate": None, "repository_context": assessment.get("summary", {})}
-    selected = min(
+    return sorted(
         candidates,
         key=lambda item: (
             -item["priority_score"],
@@ -99,7 +92,26 @@ def next_query(root: Path) -> dict[str, Any]:
             item["function_id"],
         ),
     )
-    return {**base, "status": "ok", "candidate": selected, "repository_context": assessment["summary"]}
 
 
-__all__ = ["next_query"]
+def next_query(root: Path) -> dict[str, Any]:
+    """Return a next candidate only from current, source/config-fresh analysis."""
+    analysis = load_fresh_current_analysis(root)
+    base = {"schema_version": 1, "analysis_id": analysis["analysis_id"]}
+    if not analysis.get("suite", {}).get("passed", False):
+        return {**base, "status": "blocked", "reason": "suite-failed"}
+    if analysis.get("coverage", {}).get("status") != "available":
+        return {**base, "status": "blocked", "reason": "coverage-unavailable"}
+
+    assessment = analysis.get("assessment")
+    if not isinstance(assessment, dict):
+        raise ValueError("current CovLedger analysis is missing its assessment")
+    candidates = ranked_gap_candidates(analysis)
+    if not candidates:
+        if assessment.get("summary", {}).get("functions_with_gaps"):
+            return {**base, "status": "blocked", "reason": "stale-analysis"}
+        return {**base, "status": "ok", "candidate": None, "repository_context": assessment.get("summary", {})}
+    return {**base, "status": "ok", "candidate": candidates[0], "repository_context": assessment["summary"]}
+
+
+__all__ = ["next_query", "ranked_gap_candidates"]

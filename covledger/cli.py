@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agent_analysis import analyze_current
 from .inferlingo_rules import derive_proofs
 from .ledgercore_backend import initialize_covledger
 from .next_query import next_query
@@ -375,6 +376,77 @@ def _handle_next(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_analyze(root: Path, args: argparse.Namespace) -> int:
+    result = analyze_current(
+        root,
+        all_functions=args.all_functions,
+        max_requests=args.max_requests,
+        plan=args.plan,
+        cache_only=args.cache_only,
+        refresh=args.refresh,
+    )
+    if args.json_output:
+        _json(result)
+        return 0
+
+    status = result["status"]
+    if status == "suite-failed":
+        print("current test suite failed; fix the suite before semantic gap analysis")
+        return 0
+    if status == "coverage-unavailable":
+        print("coverage is unavailable; no semantic gap analysis performed")
+        return 0
+    if status == "stale-analysis":
+        print("current analysis has stale gap evidence; rerun `covledger run -- pytest -q`")
+        return 0
+    if status == "no-target":
+        print("No unresolved coverage candidate.")
+        return 0
+    if status == "budget-blocked":
+        cost = result["cost"]
+        print(
+            "analysis blocked before semantic requests: "
+            f"{cost['required_api_requests']} required; "
+            f"budget {cost['max_api_requests'] if cost['max_api_requests'] is not None else 'unspecified'}"
+        )
+        return 0
+
+    selection = result["selection"]
+    cost = result["cost"]
+    print(
+        f"analysis {status} ({result['mode']}): "
+        f"{selection['selected_function_count']} function(s), "
+        f"{selection['selected_gap_count']} gap(s)"
+    )
+    target = result["targets"][0] if result["targets"] else None
+    if target is None:
+        return 0
+    print(
+        f"P{target['priority']['score']} {target['priority']['band']}  "
+        f"{target['function_id']}  {target['path']}:{target['line']}  {target['qualname']}"
+    )
+    gap = target["primary_gap"]
+    print(f"gap: {gap['gap_id']}  {gap['kind']}  line {gap['line']}  {gap['label']}")
+    semantic = target["semantic"]
+    print(f"semantic: {semantic['status']}")
+    for finding in semantic.get("findings") or []:
+        judgments = semantic.get("judgments") or {}
+        probability = judgments.get(finding)
+        rendered = f"{probability:.2f}" if isinstance(probability, (int, float)) else "?"
+        print(f"    {finding}  {rendered}")
+    print(f"cost: API requests {cost['api_requests']} / {cost['max_api_requests']}")
+    usage = cost.get("usage")
+    if isinstance(usage, dict):
+        if "input_tokens" in usage:
+            print(f"    input tokens  {usage['input_tokens']}")
+        if "output_tokens" in usage:
+            print(f"    output tokens {usage['output_tokens']}")
+    if selection["selected_function_count"] > 1:
+        print(f"    {selection['selected_function_count'] - 1} additional target(s); use --json for details")
+    print(f"suggested action: {target['agent']['objective']}")
+    return 0
+
+
 def _handle_inspect(root: Path, args: argparse.Namespace) -> int:
     analysis, assessment = _current(root)
     query_id = args.query_id
@@ -547,6 +619,17 @@ def build_parser() -> argparse.ArgumentParser:
     next_parser = sub.add_parser("next", help="select the next uncovered behavior from current analysis")
     next_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    analyze = sub.add_parser("analyze", help="semantically enrich current deterministic coverage targets")
+    analyze.add_argument(
+        "--all", action="store_true", dest="all_functions", help="select all current gap-bearing functions"
+    )
+    analyze.add_argument("--max-requests", type=int, help="hard budget for uncached Jev requests")
+    analyze.add_argument("--plan", action="store_true", help="select targets and inspect cache without Jev calls")
+    analyze.add_argument("--cache-only", action="store_true", help="use cached semantic results only")
+    analyze.add_argument(
+        "--refresh", action="store_true", help="request fresh semantic judgments within the hard budget"
+    )
+    analyze.add_argument("--json", action="store_true", dest="json_output", help="emit the versioned agent response")
     report = sub.add_parser("report", help="export a report for the current analysis")
     report.add_argument("--format", choices=["md", "csv"], default="md")
     report.add_argument("--output", help="write to this explicitly requested file; defaults to stdout")
@@ -577,6 +660,8 @@ def main(argv: list[str] | None = None) -> int:
             return _handle_inspect(root, args)
         if args.command_name == "next":
             return _handle_next(root, args)
+        if args.command_name == "analyze":
+            return _handle_analyze(root, args)
         if args.command_name == "report":
             return _handle_report(root, args)
         if args.command_name == "cache" and args.cache_action == "path":

@@ -38,6 +38,7 @@ def test_run_publishes_one_compact_current_analysis_and_cleans_work(tmp_path: Pa
     current = load_current_analysis(tmp_path)
     app_hash = hashlib.sha256((tmp_path / "app.py").read_bytes()).hexdigest()
     assert analysis["suite"]["passed"] is True
+    assert analysis["suite"]["pytest_args"] == ["pytest", "-q"]
     assert current["analysis_id"] == analysis["analysis_id"]
     assert current["coverage"]["status"] == "available"
     app = current["coverage"]["files"]["app.py"]
@@ -68,7 +69,7 @@ def test_run_replaces_current_result_and_keeps_failed_suite_status(tmp_path: Pat
     second = run_pytest(tmp_path, ["pytest", "-q"])
 
     assert first["analysis_id"] != second["analysis_id"]
-    assert second["suite"] == {"passed": False, "exit_code": 1}
+    assert second["suite"] == {"passed": False, "exit_code": 1, "pytest_args": ["pytest", "-q"]}
     assert load_current_analysis(tmp_path)["analysis_id"] == second["analysis_id"]
     assert len(list(cache_root(tmp_path).glob("current.json"))) == 1
     assert _empty_work(cache_root(tmp_path))

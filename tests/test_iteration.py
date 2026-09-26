@@ -5,11 +5,11 @@ import pytest
 
 from covledger.gaps import derive_gaps
 from covledger.ledgercore_backend import initialize_covledger
-from covledger.next_query import next_query
-from covledger.quality import semantic_cache_key
+from covledger.next_query import next_query, ranked_gap_candidates
+from covledger.quality import semantic_cache_key, semantic_cache_status
 from covledger.runner import run_pytest
 from covledger.source import extract_functions
-from covledger.storage import StaleAnalysisError, load_fresh_current_analysis
+from covledger.storage import StaleAnalysisError, load_fresh_current_analysis, semantic_cache_path
 
 
 def _project(root: Path, *, failing_test: bool = False) -> None:
@@ -45,6 +45,24 @@ def test_semantic_cache_key_ignores_path_and_start_line(tmp_path: Path) -> None:
     assert semantic_cache_key(one) == semantic_cache_key(two)
 
 
+def test_semantic_cache_status_detects_miss_and_hit_without_execution(tmp_path: Path) -> None:
+    initialize_covledger(tmp_path)
+    source_path = tmp_path / "app.py"
+    source_path.write_text("def process(value):\n    return value\n", encoding="utf-8")
+    item = extract_functions(source_path, root=tmp_path)[0]
+
+    status = semantic_cache_status(item, root=tmp_path)
+    assert status.cache_key == semantic_cache_key(item)
+    assert not status.cached
+
+    cache_path = semantic_cache_path(tmp_path, status.cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text('{"model":"cached","judgments":{"rule":0.8}}', encoding="utf-8")
+    cached = semantic_cache_status(item, root=tmp_path)
+    assert cached.cached
+    assert cached.result == {"model": "cached", "judgments": {"rule": 0.8}}
+
+
 def test_next_selects_current_uncovered_error_path(tmp_path: Path) -> None:
     _project(tmp_path)
 
@@ -55,6 +73,7 @@ def test_next_selects_current_uncovered_error_path(tmp_path: Path) -> None:
     assert result["analysis_id"] == analysis["analysis_id"]
     assert "run_id" not in result
     assert result["candidate"]["gap"]["kind"] == "error-path"
+    assert ranked_gap_candidates(analysis)[0] == result["candidate"]
     assert result["candidate"]["gap"]["label"] == "except Exception"
     assert result["candidate"]["function"]["qualname"] == "process"
     assert result["candidate"]["semantic"]["source"] == "none"

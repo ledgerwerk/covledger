@@ -39,6 +39,30 @@ covledger run -- pytest -q
 
 Run accepts pytest arguments (for example, `covledger run -- python -m pytest -q`). The command uses the Python interpreter running CovLedger and does not persist pytest output.
 
+## Agent coverage workflow
+
+For the default improve-one-gap loop, run tests through CovLedger, inspect one deterministic current target with semantic context, make the code/test change yourself, then rerun the suite:
+
+```bash
+covledger run -- pytest -q
+covledger analyze --json
+# inspect the target, edit/test the gap
+covledger run -- pytest -q
+```
+
+`run` and `next` make zero Jev requests. Default `analyze` selects the same highest-priority actionable target as `next`, includes all gaps for that function and its live hash-verified source, and makes at most one uncached Jev request. Existing content-addressed semantic cache entries are reused, so repeated analysis may make zero requests. If tests fail or coverage is unavailable, analysis does not spend a Jev request. Use the versioned `--json` response for agent automation; it includes suite and coverage state, target priority and evidence, semantic provenance, proofs, and recommended next steps.
+
+Batch semantic analysis is opt-in. First inspect all selected functions and cache misses without API calls, then provide an explicit hard request budget if running the batch:
+
+```bash
+covledger analyze --all --plan --json
+covledger analyze --all --max-requests 10 --json
+```
+
+The preflight checks the whole batch before any uncached request; an absent or insufficient budget blocks the batch rather than partially processing it. One function with multiple gaps still needs one semantic request. Use `covledger analyze --cache-only --json` for zero-call cache inspection. Use `--refresh` only when fresh judgments are explicitly requested; it ignores cache reuse but does not bypass the request budget. A single-target request is capped at one even if `--max-requests` is larger. Do not use a repository-wide `quality --semantic` sweep for the default next-gap workflow; that is a separate source-quality command.
+
+The agent instructions live in the checked-in [CovLedger skill](skills/covledger/SKILL.md). The skill is repository-level, not wheel package data: the current setuptools package configuration and a built-wheel inspection include CovLedger modules/assets but omit the top-level `skills/` directory.
+
 ## Current analysis
 
 A completed run publishes one `current.json` in LedgerCore's checkout-scoped cache. These commands use that result without rerunning pytest:

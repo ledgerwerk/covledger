@@ -44,7 +44,7 @@ def _write_legacy_manifest(root: Path) -> Path:
 
 def test_cli_exposes_current_analysis_commands_without_history_or_diff() -> None:
     help_text = build_parser().format_help()
-    for command in ("init", "run", "quality", "overview", "findings", "inspect", "next", "report", "cache"):
+    for command in ("init", "run", "quality", "overview", "findings", "inspect", "next", "analyze", "report", "cache"):
         assert command in help_text
     assert "runs" not in help_text
     assert "diff" not in help_text
