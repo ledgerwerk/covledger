@@ -1,97 +1,154 @@
+import hashlib
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
+from ledgercore import uuid7
 
-from covledger.diffing import diff_runs
+import covledger.runner as runner
 from covledger.ledgercore_backend import initialize_covledger
 from covledger.runner import run_pytest
-from covledger.storage import runs_root
+from covledger.storage import cache_root, current_analysis_path, load_current_analysis, publish_current_analysis
 
 
-def test_run_records_line_and_branch_gaps(tmp_path: Path) -> None:
-    initialize_covledger(tmp_path)
-    (tmp_path / "app.py").write_text(
-        "def classify(value):\n    if value > 0:\n        return 'positive'\n    return 'other'\n",
+def _project(root: Path, *, app_source: str | None = None) -> None:
+    initialize_covledger(root)
+    (root / "app.py").write_text(
+        app_source or "def classify(value):\n    if value > 0:\n        return 'positive'\n    return 'other'\n",
         encoding="utf-8",
     )
-    (tmp_path / "test_app.py").write_text(
+    (root / "test_app.py").write_text(
         "from app import classify\n\ndef test_positive():\n    assert classify(1) == 'positive'\n",
         encoding="utf-8",
     )
-    report = run_pytest(tmp_path, ["pytest", "-q"])
 
-    assert report["suite_passed"] is True
-    app = report["coverage"]["files"]["app.py"]
+
+def _empty_work(cache: Path) -> bool:
+    work = cache / "work"
+    return not work.exists() or not any(work.iterdir())
+
+
+def test_run_publishes_one_compact_current_analysis_and_cleans_work(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    analysis = run_pytest(tmp_path, ["pytest", "-q"])
+
+    cache = cache_root(tmp_path)
+    current = load_current_analysis(tmp_path)
+    app_hash = hashlib.sha256((tmp_path / "app.py").read_bytes()).hexdigest()
+    assert analysis["suite"]["passed"] is True
+    assert current["analysis_id"] == analysis["analysis_id"]
+    assert current["coverage"]["status"] == "available"
+    app = current["coverage"]["files"]["app.py"]
     assert 4 in app["missing_lines"]
     assert [2, 4] in app["missing_branches"]
-    run_dir = runs_root(tmp_path) / report["run_id"]
-    assert run_dir.is_dir()
-    assert (run_dir / "run.json").is_file()
-    assert (run_dir / "sources" / "app.py").read_text(encoding="utf-8").startswith("def classify")
-    assert not (tmp_path / ".covledger").exists()
-    assert not (tmp_path / ".ledger" / "covledger" / "runs").exists()
+    assert current["scope"]["files"] == {"app.py": {"sha256": app_hash}}
+    assert current["scope"]["config_sha256"]
+    assert set(current) == {"schema_version", "analysis_id", "suite", "coverage", "scope", "assessment"}
+    assert {path.name for path in cache.iterdir()} == {".ledger-project.toml", "current.json", "work"}
+    assert _empty_work(cache)
+    assert not list(cache.rglob("*.py"))
+    assert not list(cache.rglob(".coverage"))
+    assert not list(cache.rglob("coverage.json"))
+    assert not (tmp_path / ".ledger" / "covledger" / "cache").exists()
+    assert not (tmp_path.parent / "ledger").exists()
+    mounts = tomllib.loads((tmp_path / ".ledger" / "ledger.toml").read_text())["ledgers"]["covledger"]["mounts"]
+    assert mounts == {"cache": {"storage": "cache"}}
 
 
-def test_run_respects_exclude_scope_and_persists_it(tmp_path: Path) -> None:
-    initialize_covledger(tmp_path)
+def test_run_replaces_current_result_and_keeps_failed_suite_status(tmp_path: Path) -> None:
+    _project(tmp_path)
+    first = run_pytest(tmp_path, ["pytest", "-q"])
+
+    (tmp_path / "test_app.py").write_text(
+        "from app import classify\n\ndef test_positive():\n    assert classify(-1) == 'positive'\n",
+        encoding="utf-8",
+    )
+    second = run_pytest(tmp_path, ["pytest", "-q"])
+
+    assert first["analysis_id"] != second["analysis_id"]
+    assert second["suite"] == {"passed": False, "exit_code": 1}
+    assert load_current_analysis(tmp_path)["analysis_id"] == second["analysis_id"]
+    assert len(list(cache_root(tmp_path).glob("current.json"))) == 1
+    assert _empty_work(cache_root(tmp_path))
+
+
+def test_analysis_scope_excludes_files_from_current_evidence(tmp_path: Path) -> None:
+    _project(tmp_path)
     (tmp_path / ".ledger" / "covledger" / "config.toml").write_text(
         '[analysis]\ninclude = []\nexclude = ["examples"]\ninclude_generated = false\n',
         encoding="utf-8",
     )
-    (tmp_path / "app.py").write_text("def app():\n    if False:\n        return 1\n    return 0\n", encoding="utf-8")
-    (tmp_path / "examples").mkdir()
-    (tmp_path / "examples" / "demo.py").write_text(
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "demo.py").write_text(
         "def demo():\n    if False:\n        return 1\n    return 0\n",
         encoding="utf-8",
     )
-    (tmp_path / "test_app.py").write_text(
-        "from app import app\n\ndef test_app():\n    assert app() == 0\n",
-        encoding="utf-8",
+
+    analysis = run_pytest(tmp_path, ["pytest", "-q"])
+
+    assert set(analysis["coverage"]["files"]) == {"app.py"}
+    assert set(analysis["scope"]["files"]) == {"app.py"}
+    assert all(not item["path"].startswith("examples/") for item in analysis["assessment"]["hotspots"])
+    assert all(not gap["path"].startswith("examples/") for gap in analysis["assessment"]["gaps"])
+
+
+@pytest.mark.parametrize(
+    "stage_name",
+    [
+        "_write_coveragerc",
+        "subprocess.run",
+        "_load_coverage",
+        "quality_document_from_sources",
+        "build_assessment",
+        "publish_current_analysis",
+    ],
+)
+def test_runner_cleans_work_and_leaves_no_current_result_after_stage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage_name: str,
+) -> None:
+    _project(tmp_path)
+    cache = cache_root(tmp_path)
+    publish_current_analysis(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "analysis_id": str(uuid7()),
+            "suite": {"passed": True, "exit_code": 0},
+            "coverage": {"status": "unavailable"},
+            "scope": {"config_sha256": "old", "files": {}},
+            "assessment": {"summary": {}, "hotspots": [], "findings": [], "gaps": []},
+        },
     )
 
-    report = run_pytest(tmp_path, ["pytest", "-q"])
-    assert set(report["coverage"]["files"]) == {"app.py"}
-    assert set(report["quality"]["files"]) == {"app.py"}
-    run_dir = runs_root(tmp_path) / report["run_id"]
-    assert (run_dir / "sources" / "app.py").is_file()
-    assert not (run_dir / "sources" / "examples" / "demo.py").exists()
-    assert report["scope"]["analysis"] == {
-        "include": [],
-        "exclude": ["examples"],
-        "include_generated": False,
-    }
-    assert all(not item["path"].startswith("examples/") for item in report["assessment"]["hotspots"])
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"forced {stage_name} failure")
 
+    if stage_name == "subprocess.run":
+        monkeypatch.setattr(runner.subprocess, "run", fail)
+    else:
+        monkeypatch.setattr(runner, stage_name, fail)
 
-def test_run_rejects_non_matching_include_scope(tmp_path: Path) -> None:
-    initialize_covledger(tmp_path)
-    (tmp_path / ".ledger" / "covledger" / "config.toml").write_text(
-        '[analysis]\ninclude = ["does-not-exist"]\n', encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="analysis.include matched no eligible Python source files"):
+    with pytest.raises(RuntimeError, match="forced"):
         run_pytest(tmp_path, ["pytest", "-q"])
 
+    assert not current_analysis_path(tmp_path).exists()
+    assert _empty_work(cache)
 
-def test_historical_run_scope_is_immutable_and_diff_tracks_file_sets(tmp_path: Path) -> None:
-    initialize_covledger(tmp_path)
-    (tmp_path / "src").mkdir()
-    (tmp_path / "examples").mkdir()
-    (tmp_path / "src" / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "examples" / "demo.py").write_text("def demo():\n    return 2\n", encoding="utf-8")
-    (tmp_path / "test_app.py").write_text(
-        "from src.app import app\n\ndef test_app():\n    assert app() == 1\n",
-        encoding="utf-8",
-    )
-    config_path = tmp_path / ".ledger" / "covledger" / "config.toml"
-    config_path.write_text('[analysis]\ninclude = ["src"]\n', encoding="utf-8")
-    first = run_pytest(tmp_path, ["pytest", "-q"])
-    config_path.write_text('[analysis]\ninclude = ["examples"]\n', encoding="utf-8")
-    second = run_pytest(tmp_path, ["pytest", "-q"])
 
-    assert set(first["coverage"]["files"]) == {"src/app.py"}
-    assert set(second["coverage"]["files"]) == {"examples/demo.py"}
-    first_dir = runs_root(tmp_path) / first["run_id"]
-    assert json.loads((first_dir / "scope.json").read_text())["analysis"]["include"] == ["src"]
-    diff = diff_runs(first, second)
-    assert diff["files"]["examples/demo.py"]["before"]["source_sha256"] is None
+def test_run_work_area_contains_no_permanent_raw_coverage(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    run_pytest(tmp_path, ["python", "-m", "pytest", "-q"])
+
+    cache = cache_root(tmp_path)
+    assert _empty_work(cache)
+    assert not any(cache.rglob(".coverage"))
+    assert not any(cache.rglob("coveragerc"))
+    assert not any(cache.rglob("coverage.json"))
+    current = json.loads(current_analysis_path(tmp_path).read_text(encoding="utf-8"))
+    assert all("snapshot" not in value for value in current["scope"]["files"].values())

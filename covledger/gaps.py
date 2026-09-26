@@ -1,13 +1,15 @@
-"""Source-aware coverage gap candidates shared by historical queries and next."""
+"""Source-aware coverage gap candidates for a current analysis."""
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .identity import gap_id
 from .source import SourceRegion, index_regions
+from .storage import resolve_source
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,20 +135,26 @@ def extract_functions_from_source(source: str, path: str) -> list[Any]:
     return collector.functions
 
 
-def gaps_for_file(path: str, coverage_file: dict[str, Any], snapshot: Path) -> list[GapCandidate]:
-    return derive_gaps(path, coverage_file, snapshot.read_text(encoding="utf-8", errors="replace"))
-
-
-def gaps_for_run(run: dict[str, Any], run_dir: Path) -> list[GapCandidate]:
-    coverage = run.get("coverage", {})
+def gaps_for_analysis(analysis: dict[str, Any], project_root: Path) -> list[GapCandidate]:
+    """Derive gaps from live checkout files whose hashes match the analysis."""
+    coverage = analysis.get("coverage", {})
     if coverage.get("status") != "available":
         return []
+    scope_files = analysis.get("scope", {}).get("files", {})
     result: list[GapCandidate] = []
     for path, item in sorted(coverage.get("files", {}).items()):
-        snapshot = run_dir / "sources" / path
-        if snapshot.is_file():
-            result.extend(gaps_for_file(path, item, snapshot))
+        try:
+            source_path = resolve_source(project_root, path)
+            source_bytes = source_path.read_bytes()
+            source = source_bytes.decode("utf-8", errors="replace")
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"cannot read current source for cached analysis: {path}") from exc
+        expected = scope_files.get(path, {}).get("sha256") or item.get("source_sha256")
+        actual = hashlib.sha256(source_bytes).hexdigest()
+        if expected and actual != expected:
+            raise ValueError(f"source changed while building current CovLedger analysis: {path}")
+        result.extend(derive_gaps(path, item, source))
     return result
 
 
-__all__ = ["GapCandidate", "derive_gaps", "gaps_for_file", "gaps_for_run"]
+__all__ = ["GapCandidate", "derive_gaps", "gaps_for_analysis"]

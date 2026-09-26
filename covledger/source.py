@@ -553,6 +553,20 @@ def source_sha256(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def read_verified_source(root: Path, relative_path: str, expected_sha256: str) -> str:
+    """Read a live project file only if it still matches the cached source hash."""
+    from .storage import StaleAnalysisError, resolve_source
+
+    try:
+        path = resolve_source(root, relative_path)
+        content = path.read_bytes()
+    except Exception as exc:
+        raise StaleAnalysisError([relative_path]) from exc
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise StaleAnalysisError([relative_path])
+    return content.decode("utf-8", errors="replace")
+
+
 def extract_source_index(path: Path, *, root: Path | None = None) -> dict[str, Any]:
     source = path.read_text(encoding="utf-8")
     return {

@@ -3,7 +3,7 @@ from covledger.inferlingo_rules import derive_proofs, rules_sha256
 
 def test_exact_rules_derive_error_path_proof() -> None:
     assessment = {
-        "run_id": "run-1",
+        "analysis_id": "0192f9bd-7e5e-7d5c-ae7c-2fcd90c4d3cb",
         "gaps": [
             {"gap_id": "G-1", "path": "app.py", "line": 4, "gap": {"kind": "error-path", "label": "except Exception"}},
         ],

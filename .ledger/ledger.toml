@@ -23,9 +23,5 @@ storage = "project"
 [ledgers.releaseledger.mounts.indexes]
 storage = "cache"
 
-[ledgers.covledger.mounts.runs]
-storage = "external"
-root = "../ledger"
-
 [ledgers.covledger.mounts.cache]
 storage = "cache"

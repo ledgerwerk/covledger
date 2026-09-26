@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import importlib.resources
+import os
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,29 @@ from .storage import load_covledger_config, semantic_cache_path
 
 DEFAULT_THRESHOLD = 0.70
 DECISION = "covledger-quality"
+SEMANTIC_CACHE_SCHEMA = 3
+SEMANTIC_CONTRACT_VERSION = 1
+
+
+def _effective_threshold(root: Path, threshold: float | None) -> float:
+    if threshold is None:
+        config_path = root / ".ledger" / "covledger" / "config.toml"
+        quality = load_covledger_config(root).get("quality", {}) if config_path.is_file() else {}
+        threshold = (
+            float(quality.get("semantic_threshold", DEFAULT_THRESHOLD))
+            if isinstance(quality, dict)
+            else DEFAULT_THRESHOLD
+        )
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("semantic threshold must be between 0 and 1")
+    return threshold
+
+
+def _distribution_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def _analysis_scope(root: Path) -> AnalysisScope:
@@ -96,9 +121,16 @@ def _semantic_facts(item: FunctionFacts) -> dict[str, Any]:
 
 
 def _semantic_key(item: FunctionFacts) -> str:
+    model = os.environ.get("TYPESAFE_DEFAULT_MODEL", "").strip() or None
+    endpoint = os.environ.get("TYPESAFE_BASE_URL", "").strip() or None
     payload = {
-        "cache_schema": 2,
+        "cache_schema": SEMANTIC_CACHE_SCHEMA,
         "decision": DECISION,
+        "decision_contract_version": SEMANTIC_CONTRACT_VERSION,
+        "pyjev_version": _distribution_version("pyjev"),
+        "typesafe_sdk_version": _distribution_version("typesafe-sdk"),
+        "model": model or "typesafe-sdk-default",
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest() if endpoint else None,
         "rules_sha256": _rules_sha256(),
         "function_source_sha256": source_sha256(item.source),
         "exact_facts": _semantic_facts(item),
@@ -144,7 +176,7 @@ def semantic_judgments(item: FunctionFacts, *, root: Path, refresh: bool = False
             raise TypeError(f"rule {rule!r} must return NoulResult, got {type(answer).__name__}")
         judgments[rule] = float(answer.value)
     payload = {
-        "cache_schema": 2,
+        "cache_schema": SEMANTIC_CACHE_SCHEMA,
         "cache_key": _semantic_key(item),
         "model": result.model,
         "request_id": result.request_id,
@@ -194,9 +226,10 @@ def quality_document_from_sources(
     *,
     root: Path,
     semantic: bool = False,
-    threshold: float = DEFAULT_THRESHOLD,
+    threshold: float | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
+    threshold = _effective_threshold(root, threshold)
     files: dict[str, Any] = {}
     for display_path, path in sorted(sources.items()):
         source = path.read_text(encoding="utf-8")
@@ -259,11 +292,12 @@ def quality_report(
     *,
     root: Path,
     semantic: bool = False,
-    threshold: float = DEFAULT_THRESHOLD,
+    threshold: float | None = None,
     refresh: bool = False,
     max_functions: int | None = None,
     include_generated: bool | None = None,
 ) -> dict[str, Any]:
+    threshold = _effective_threshold(root, threshold)
     functions = collect_functions(target, root=root, include_generated=include_generated)
     if max_functions is not None:
         functions = functions[:max_functions]

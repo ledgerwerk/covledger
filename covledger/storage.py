@@ -1,15 +1,16 @@
-"""Ledgercore-backed immutable CovLedger storage."""
+"""Disposable CovLedger state in Ledgercore's checkout-scoped cache."""
 
 from __future__ import annotations
 
-import os
-import secrets
-from dataclasses import dataclass
+import hashlib
+import json
+import shutil
+import tomllib
 from pathlib import Path
 from typing import Any
 
 from ledgercore import (
-    atomic_create_text,
+    atomic_write_text,
     dumps_json,
     ensure_inside_base,
     load_json_object,
@@ -18,220 +19,256 @@ from ledgercore import (
     uuid7,
 )
 
-from .ledgercore_backend import load_covledger_ledger_layout
+from .ledgercore_backend import CACHE_MOUNT, load_covledger_ledger_layout
 
-RUNS_DIR = "runs"
+CURRENT_ANALYSIS_FILENAME = "current.json"
+
+_DEFAULT_CONFIG: dict[str, Any] = {
+    "config_version": 2,
+    "ledger": {"code": "cov", "name": "covledger"},
+    "coverage": {"branch": True},
+    "quality": {"semantic_threshold": 0.70},
+    "analysis": {
+        "include_generated": False,
+        "include": [],
+        "exclude": ["context_*.unpack.py"],
+    },
+    "priority": {"high": 70, "critical": 85},
+    "decision": [],
+}
+
+_ANALYSIS_CONFIG_DEFAULTS: dict[str, Any] = {
+    "coverage": {"branch": True},
+    "quality": {"semantic_threshold": 0.70},
+    "analysis": {
+        "include_generated": False,
+        "include": [],
+        "exclude": ["context_*.unpack.py"],
+    },
+    "priority": {"high": 70, "critical": 85},
+    "decision": [],
+}
 
 
-class RunNotFound(ValueError):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class CovLedgerLayout:
-    project_root: Path
-    runs_path: Path
-    cache_path: Path
-    tool_config_path: Path
-    ledgercore: Any | None = None
-
-
-def load_covledger_layout(root: Path, *, for_write: bool = False) -> CovLedgerLayout:
-    """Resolve and validate the canonical CovLedger Ledgercore layout."""
-    del for_write
-    layout = load_covledger_ledger_layout(root)
-    return CovLedgerLayout(
-        layout.project_root,
-        layout.mounts["runs"].path,
-        layout.mounts["cache"].path,
-        layout.tool_config_path,
-        layout,
-    )
+def _layout(root: Path) -> Any:
+    return load_covledger_ledger_layout(root)
 
 
 def load_covledger_config(root: Path) -> dict[str, Any]:
-    import tomllib
-
-    layout = load_covledger_layout(root)
-    if not layout.tool_config_path.is_file():
-        return {
-            "config_version": 1,
-            "ledger": {"code": "cov", "name": "covledger"},
-            "coverage": {"branch": True},
-            "quality": {"semantic_threshold": 0.70},
-            "analysis": {
-                "include_generated": False,
-                "include": [],
-                "exclude": ["context_*.unpack.py"],
-            },
-            "priority": {"high": 70, "critical": 85, "campaign_high_count": 3},
-        }
-    return tomllib.loads(layout.tool_config_path.read_text(encoding="utf-8"))
-
-
-def new_run_id() -> str:
-    return str(uuid7())
-
-
-def validate_run_id(value: str) -> str:
+    """Load durable project policy, using defaults only if config is absent."""
+    config_path = _layout(root).tool_config_path
+    if config_path is None or not config_path.is_file():
+        return json.loads(json.dumps(_DEFAULT_CONFIG))
     try:
-        return str(parse_uuid7(value))
-    except Exception as exc:
-        raise ValueError(f"invalid CovLedger run id: {value}") from exc
-
-
-def runs_root(root: Path) -> Path:
-    return load_covledger_layout(root).runs_path
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid CovLedger config at {config_path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"invalid CovLedger config at {config_path}: expected a TOML table")
+    return config
 
 
 def cache_root(root: Path) -> Path:
-    return load_covledger_layout(root).cache_path
+    """Return the cache path resolved by Ledgercore for this checkout."""
+    return _layout(root).mounts[CACHE_MOUNT].path
 
 
-def list_run_ids(root: Path) -> list[str]:
-    directory = runs_root(root)
-    result: list[str] = []
-    for path in directory.iterdir():
-        if not path.is_dir() or not (path / "run.json").is_file():
-            continue
+def current_analysis_path(root: Path) -> Path:
+    """Return the one replaceable cached analysis path."""
+    return cache_root(root) / CURRENT_ANALYSIS_FILENAME
+
+
+def load_current_analysis(root: Path) -> dict[str, Any]:
+    """Load the current compact analysis or explain how to create one."""
+    path = current_analysis_path(root)
+    if path.is_symlink():
+        raise ValueError(f"refusing to read symlinked current analysis: {path}")
+    if not path.is_file():
+        raise FileNotFoundError("no current CovLedger analysis; run `covledger run -- pytest ...`")
+    payload = load_json_object(path, label="current CovLedger analysis")
+    if payload.get("schema_version") != 1:
+        raise ValueError(f"unsupported current CovLedger analysis schema in {path}")
+    return payload
+
+
+class StaleAnalysisError(ValueError):
+    """Raised when cached analysis no longer describes the current checkout."""
+
+    def __init__(self, changed: list[str]) -> None:
+        self.changed = tuple(changed)
+        details = ", ".join(changed)
+        super().__init__(f"current CovLedger analysis is stale ({details}); rerun with `covledger run -- pytest ...`")
+
+
+def validate_current_source_state(root: Path, current: dict[str, Any]) -> None:
+    """Require every cached source hash and the analysis-affecting config to match."""
+    scope = current.get("scope")
+    if not isinstance(scope, dict):
+        raise ValueError("invalid current CovLedger analysis: missing scope metadata")
+    files = scope.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("invalid current CovLedger analysis: invalid source hash map")
+    expected_config = scope.get("config_sha256")
+    if not isinstance(expected_config, str) or not expected_config:
+        raise ValueError("invalid current CovLedger analysis: missing config fingerprint")
+
+    changed: list[str] = []
+    for relative_path, metadata in sorted(files.items()):
+        if not isinstance(relative_path, str) or not isinstance(metadata, dict):
+            raise ValueError("invalid current CovLedger analysis: malformed source hash entry")
+        expected_hash = metadata.get("sha256")
+        if not isinstance(expected_hash, str) or not expected_hash:
+            raise ValueError(f"invalid current CovLedger analysis: missing source hash for {relative_path}")
         try:
-            run_id = validate_run_id(path.name)
-            load_json_object(path / "run.json", label="run metadata")
-        except (OSError, ValueError, TypeError):
+            source_path = resolve_source(root, relative_path)
+            if not source_path.is_file() or hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash:
+                changed.append(relative_path)
+        except Exception:
+            changed.append(relative_path)
+    if analysis_config_sha256(root) != expected_config:
+        changed.append("CovLedger configuration")
+    if changed:
+        raise StaleAnalysisError(changed)
+
+
+def load_fresh_current_analysis(root: Path) -> dict[str, Any]:
+    """Load current.json and reject changed source or policy before use."""
+    current = load_current_analysis(root)
+    validate_current_source_state(root, current)
+    return current
+
+
+def clear_current_analysis(root: Path) -> None:
+    """Remove only current.json, leaving semantic cache and ownership metadata intact."""
+    path = current_analysis_path(root)
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise ValueError(f"refusing to remove unexpected current analysis path: {path}")
+
+
+def create_work_dir(root: Path, analysis_id: str | None = None) -> Path:
+    """Create a private per-analysis work directory under the resolved cache mount."""
+    canonical_id = str(uuid7()) if analysis_id is None else str(analysis_id)
+    if "/" in canonical_id or "\\" in canonical_id or Path(canonical_id).name != canonical_id:
+        raise ValueError(f"invalid CovLedger analysis id: {canonical_id}")
+    try:
+        canonical_id = str(parse_uuid7(canonical_id))
+    except Exception as exc:
+        raise ValueError(f"invalid CovLedger analysis id: {canonical_id}") from exc
+    cache = cache_root(root)
+    cache_resolved = cache.resolve()
+    work_root = cache / "work"
+    if work_root.is_symlink():
+        raise ValueError(f"refusing to use symlinked CovLedger work directory: {work_root}")
+    work_root.mkdir(parents=True, exist_ok=True)
+    try:
+        work_root.resolve().relative_to(cache_resolved)
+    except ValueError as exc:
+        raise ValueError(f"CovLedger work directory escapes the cache mount: {work_root}") from exc
+    work_dir = work_root / canonical_id
+    work_dir.mkdir(parents=False, exist_ok=False)
+    return work_dir
+
+
+def publish_current_analysis(root: Path, payload: dict[str, Any]) -> Path:
+    """Atomically replace current.json after the complete analysis is available."""
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("current CovLedger analysis payload must use schema_version 1")
+    path = current_analysis_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, dumps_json(payload))
+    return path
+
+
+def _analysis_config(config: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for section, defaults in _ANALYSIS_CONFIG_DEFAULTS.items():
+        raw = config.get(section, defaults)
+        if section == "decision":
+            if not isinstance(raw, list):
+                raise ValueError("invalid CovLedger decision config: expected an array of tables")
+            result[section] = raw
             continue
-        result.append(run_id)
-    return sorted(set(result), reverse=True)
-
-
-def resolve_run_id(root: Path, selector: str) -> str:
-    if selector == "latest":
-        runs = list_run_ids(root)
-        if not runs:
-            raise RunNotFound("no CovLedger runs found")
-        return runs[0]
-    if len(selector) < 8:
-        raise RunNotFound("run selector prefix must be at least 8 characters")
-    matches = [run_id for run_id in list_run_ids(root) if run_id.startswith(selector)]
-    if not matches:
-        raise RunNotFound(f"run not found: {selector}")
-    if len(matches) > 1:
-        raise RunNotFound(f"ambiguous run prefix: {selector} ({', '.join(matches)})")
-    return matches[0]
-
-
-def _load_run_artifacts(run_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
-    if "coverage" in metadata:
-        return metadata
-    result = dict(metadata)
-    for name in ("scope", "coverage", "quality", "assessment"):
-        path = run_dir / f"{name}.json"
-        if path.is_file():
-            result[name] = load_json_object(path, label=f"{name} artifact")
-    result.setdefault("suite_passed", result.get("suite", {}).get("passed", False))
-    result.setdefault("exit_code", result.get("suite", {}).get("exit_code"))
-    result.setdefault("command", result.get("suite", {}).get("command", []))
+        if not isinstance(raw, dict):
+            raise ValueError(f"invalid CovLedger {section} config: expected a table")
+        result[section] = {**defaults, **raw}
     return result
 
 
-def load_run(root: Path, selector: str) -> dict[str, Any]:
-    run_id = resolve_run_id(root, selector)
-    run_dir = runs_root(root) / run_id
-    metadata = load_json_object(run_dir / "run.json", label="run metadata")
-    return _load_run_artifacts(run_dir, metadata)
-
-
-def load_artifact(root: Path, selector: str, name: str) -> dict[str, Any]:
-    run_id = resolve_run_id(root, selector)
-    return load_json_object(runs_root(root) / run_id / f"{name}.json", label=f"{name} artifact")
-
-
-def stage_run(root: Path, run_id: str | None = None) -> Path:
-    layout = load_covledger_layout(root)
-    canonical_id = validate_run_id(run_id or new_run_id())
-    while True:
-        stage = layout.runs_path / f".tmp-{canonical_id}-{secrets.token_hex(6)}"
-        try:
-            stage.mkdir(parents=True, exist_ok=False)
-            return stage
-        except FileExistsError:
-            continue
-
-
-def publish_staged_run(stage_dir: Path, run_id: str) -> Path:
-    run_id = validate_run_id(run_id)
-    target = stage_dir.parent / run_id
-    if target.exists():
-        raise FileExistsError(f"refusing to rewrite published run: {target}")
-    os.replace(stage_dir, target)
-    return target
-
-
-def publish_artifact(directory: Path, name: str, payload: dict[str, Any]) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    atomic_create_text(directory / f"{name}.json", dumps_json(payload))
-
-
-def publish_run(run_dir: Path, report: dict[str, Any]) -> None:
-    """Compatibility helper for direct publication."""
-    target = run_dir / "run.json"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        raise FileExistsError(f"refusing to rewrite published run: {target}")
-    if run_dir.parent.name == RUNS_DIR:
-        validate_run_id(run_dir.name)
-    if "coverage" in report and "scope" in report:
-        metadata = dict(report)
-        coverage = metadata.pop("coverage")
-        scope = metadata.pop("scope")
-        quality = metadata.pop("quality", {"schema_version": 2, "files": {}})
-        metadata.setdefault("schema_version", 2)
-        publish_artifact(run_dir, "scope", scope)
-        publish_artifact(run_dir, "coverage", coverage)
-        publish_artifact(run_dir, "quality", quality)
-        atomic_create_text(target, dumps_json(metadata))
-        return
-    atomic_create_text(target, dumps_json(report))
+def analysis_config_sha256(root: Path) -> str:
+    """Hash canonical analysis-affecting policy, excluding TOML formatting/comments."""
+    config = load_covledger_config(root)
+    canonical = json.dumps(
+        _analysis_config(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def semantic_cache_path(root: Path, key: str) -> Path:
-    if "/" in key or "\\" in key or key != Path(key).name:
+    """Return a content-addressed PyJev entry under Ledgercore's cache mount."""
+    if not key or "/" in key or "\\" in key or key in {".", ".."} or Path(key).name != key:
         raise ValueError("invalid semantic cache key")
     return cache_root(root) / "jev" / f"{key}.json"
 
 
+def _remove_owned_child(cache: Path, name: str) -> None:
+    """Remove one named CovLedger-owned cache child without following its symlink."""
+    child = cache / name
+    if child.parent != cache:
+        raise ValueError(f"invalid CovLedger cache child: {child}")
+    if child.is_symlink():
+        child.unlink()
+    elif child.is_dir():
+        if name == CURRENT_ANALYSIS_FILENAME:
+            raise ValueError(f"refusing to remove unexpected current analysis directory: {child}")
+        shutil.rmtree(child)
+    elif child.exists():
+        child.unlink()
+
+
+def clear_cache(root: Path) -> None:
+    """Clear CovLedger's disposable cache children and validate Ledgercore ownership."""
+    layout = _layout(root)
+    cache = layout.mounts[CACHE_MOUNT].path
+    for name in (CURRENT_ANALYSIS_FILENAME, "jev", "work"):
+        _remove_owned_child(cache, name)
+    # Reloading validates that the Ledgercore-owned marker survived the deletion.
+    load_covledger_ledger_layout(root)
+
+
 def source_relative(root: Path, path: Path) -> str:
-    return relative_to_base(root.resolve(), ensure_inside_base(root.resolve(), path, field_name="source path"))
+    """Return a project-relative POSIX path after enforcing project containment."""
+    base = root.resolve()
+    return relative_to_base(base, ensure_inside_base(base, path, field_name="source path"))
 
 
 def resolve_source(root: Path, relative_path: str) -> Path:
+    """Resolve a cached relative source path inside the current project checkout."""
     base = root.resolve()
     candidate = (base / relative_path).resolve()
     return ensure_inside_base(base, candidate, field_name="source path")
 
 
-def ensure_artifact_path(base: Path, relative_path: str) -> Path:
-    return ensure_inside_base(base.resolve(), (base / relative_path).resolve(), field_name="artifact path")
-
-
 __all__ = [
-    "CovLedgerLayout",
-    "RunNotFound",
+    "CURRENT_ANALYSIS_FILENAME",
+    "StaleAnalysisError",
+    "analysis_config_sha256",
     "cache_root",
-    "ensure_artifact_path",
-    "list_run_ids",
-    "load_artifact",
+    "clear_cache",
+    "clear_current_analysis",
+    "create_work_dir",
+    "current_analysis_path",
     "load_covledger_config",
-    "load_covledger_layout",
-    "load_run",
-    "new_run_id",
-    "publish_artifact",
-    "publish_run",
-    "publish_staged_run",
-    "resolve_run_id",
+    "load_current_analysis",
+    "load_fresh_current_analysis",
+    "publish_current_analysis",
     "resolve_source",
-    "runs_root",
     "semantic_cache_path",
     "source_relative",
-    "stage_run",
-    "validate_run_id",
+    "validate_current_source_state",
 ]

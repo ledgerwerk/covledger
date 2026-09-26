@@ -26,7 +26,7 @@ def _facts_for_hotspot(
         source=hotspot["path"],
         line=hotspot["line"],
         kind="covledger-assessment",
-        metadata={"function_id": fn, "run_id": assessment["run_id"]},
+        metadata={"function_id": fn, "analysis_id": assessment.get("analysis_id")},
     )
     facts: list[tuple[str, dict[str, str], Provenance]] = []
     exact_findings = set(hotspot.get("facts", {}).get("exact_findings", []))

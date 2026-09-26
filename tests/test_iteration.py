@@ -1,12 +1,28 @@
+import hashlib
 from pathlib import Path
 
-from covledger.diffing import diff_runs
+import pytest
+
 from covledger.gaps import derive_gaps
 from covledger.ledgercore_backend import initialize_covledger
 from covledger.next_query import next_query
 from covledger.quality import semantic_cache_key
 from covledger.runner import run_pytest
 from covledger.source import extract_functions
+from covledger.storage import StaleAnalysisError, load_fresh_current_analysis
+
+
+def _project(root: Path, *, failing_test: bool = False) -> None:
+    initialize_covledger(root)
+    (root / "app.py").write_text(
+        "def process(value):\n    try:\n        return value\n    except Exception:\n        return None\n",
+        encoding="utf-8",
+    )
+    assertion = "assert False" if failing_test else "assert process(1) == 1"
+    (root / "test_app.py").write_text(
+        f"from app import process\n\ndef test_process():\n    {assertion}\n",
+        encoding="utf-8",
+    )
 
 
 def test_missing_except_handler_is_error_path() -> None:
@@ -15,8 +31,7 @@ def test_missing_except_handler_is_error_path() -> None:
     assert [item.kind for item in candidates] == ["error-path"]
     assert candidates[0].label == "except Exception"
     assert candidates[0].function == {"qualname": "process", "line": 1, "end_line": 5}
-    assert candidates[0].id is not None
-    assert candidates[0].id.startswith("G-")
+    assert candidates[0].id is not None and candidates[0].id.startswith("G-")
 
 
 def test_semantic_cache_key_ignores_path_and_start_line(tmp_path: Path) -> None:
@@ -30,56 +45,75 @@ def test_semantic_cache_key_ignores_path_and_start_line(tmp_path: Path) -> None:
     assert semantic_cache_key(one) == semantic_cache_key(two)
 
 
-def test_next_selects_uncovered_error_path_without_semantic_cache(tmp_path: Path) -> None:
-    (tmp_path / "app.py").write_text(
-        "def process(value):\n    try:\n        return value\n    except Exception:\n        return None\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "test_app.py").write_text(
-        "from app import process\n\ndef test_process():\n    assert process(1) == 1\n",
-        encoding="utf-8",
-    )
-    initialize_covledger(tmp_path)
-    run = run_pytest(tmp_path, ["pytest", "-q"])
+def test_next_selects_current_uncovered_error_path(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    analysis = run_pytest(tmp_path, ["pytest", "-q"])
     result = next_query(tmp_path)
+
     assert result["status"] == "ok"
-    assert result["run_id"] == run["run_id"]
+    assert result["analysis_id"] == analysis["analysis_id"]
+    assert "run_id" not in result
     assert result["candidate"]["gap"]["kind"] == "error-path"
     assert result["candidate"]["gap"]["label"] == "except Exception"
     assert result["candidate"]["function"]["qualname"] == "process"
     assert result["candidate"]["semantic"]["source"] == "none"
 
 
-def test_next_blocks_failed_suite(tmp_path: Path) -> None:
-    (tmp_path / "test_failure.py").write_text("def test_failure():\n    assert False\n", encoding="utf-8")
-    initialize_covledger(tmp_path)
-    run = run_pytest(tmp_path, ["pytest", "-q"])
-    assert run["exit_code"] != 0
-    assert next_query(tmp_path) == {
-        "schema_version": 2,
-        "run_id": run["run_id"],
+def test_next_blocks_failed_suite_without_history(tmp_path: Path) -> None:
+    _project(tmp_path, failing_test=True)
+
+    analysis = run_pytest(tmp_path, ["pytest", "-q"])
+    result = next_query(tmp_path)
+
+    assert analysis["suite"]["exit_code"] != 0
+    assert result == {
+        "schema_version": 1,
+        "analysis_id": analysis["analysis_id"],
         "status": "blocked",
         "reason": "suite-failed",
     }
 
 
-def test_diff_does_not_compare_changed_source() -> None:
-    old = {
-        "run_id": "old",
-        "coverage": {
-            "totals": {"line_percent": 50.0, "branch_percent": 50.0},
-            "files": {"app.py": {"source_sha256": "a", "missing_lines": [2], "missing_branches": [[1, 2]]}},
-        },
-    }
-    new = {
-        "run_id": "new",
-        "suite_passed": True,
-        "coverage": {
-            "totals": {"line_percent": 75.0, "branch_percent": 75.0},
-            "files": {"app.py": {"source_sha256": "b", "missing_lines": [], "missing_branches": []}},
-        },
-    }
-    result = diff_runs(old, new)
-    assert result["source_changed"] is True
-    assert result["files"]["app.py"]["source_changed"] is True
-    assert "newly_covered_lines" not in result["files"]["app.py"]
+def test_fresh_current_analysis_rejects_changed_and_missing_source(tmp_path: Path) -> None:
+    _project(tmp_path)
+    analysis = run_pytest(tmp_path, ["pytest", "-q"])
+
+    (tmp_path / "app.py").write_text("def process(value):\n    return value\n", encoding="utf-8")
+    with pytest.raises(StaleAnalysisError, match="app.py"):
+        load_fresh_current_analysis(tmp_path)
+    with pytest.raises(StaleAnalysisError, match="app.py"):
+        next_query(tmp_path)
+
+    (tmp_path / "app.py").unlink()
+    with pytest.raises(StaleAnalysisError, match="app.py"):
+        load_fresh_current_analysis(tmp_path)
+    assert analysis["scope"]["files"]["app.py"]["sha256"]
+
+
+def test_fresh_current_analysis_rejects_config_changes(tmp_path: Path) -> None:
+    _project(tmp_path)
+    run_pytest(tmp_path, ["pytest", "-q"])
+    config_path = tmp_path / ".ledger" / "covledger" / "config.toml"
+    before = config_path.read_text(encoding="utf-8")
+    config_path.write_text(before.replace("include = []", 'include = ["src"]'), encoding="utf-8")
+
+    with pytest.raises(StaleAnalysisError, match="CovLedger configuration"):
+        load_fresh_current_analysis(tmp_path)
+
+
+def test_freshness_rejects_cached_paths_outside_project(tmp_path: Path) -> None:
+    _project(tmp_path)
+    analysis = run_pytest(tmp_path, ["pytest", "-q"])
+    analysis["scope"]["files"]["../outside.py"] = {"sha256": hashlib.sha256(b"outside").hexdigest()}
+    from covledger.storage import validate_current_source_state
+
+    with pytest.raises(StaleAnalysisError, match="outside.py"):
+        validate_current_source_state(tmp_path, analysis)
+
+
+def test_next_requires_current_analysis(tmp_path: Path) -> None:
+    initialize_covledger(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="covledger run -- pytest"):
+        next_query(tmp_path)

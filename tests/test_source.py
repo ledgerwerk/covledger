@@ -1,6 +1,10 @@
+import hashlib
 from pathlib import Path
 
-from covledger.source import classify_source, discover_python_files, extract_functions
+import pytest
+
+from covledger.source import classify_source, discover_python_files, extract_functions, read_verified_source
+from covledger.storage import StaleAnalysisError
 
 
 def test_generated_sources_are_excluded_by_default(tmp_path: Path) -> None:
@@ -35,3 +39,21 @@ def test_extracts_python_facts(tmp_path: Path) -> None:
     assert function.eval_exec_calls == ("eval",)
     assert "mutable-default" in function.exact_findings
     assert "broad-except" in function.exact_findings
+
+
+def test_read_verified_source_uses_current_checkout_and_hash(tmp_path: Path) -> None:
+    source = tmp_path / "pkg" / "module.py"
+    source.parent.mkdir()
+    source.write_text("def value(): return 1\n", encoding="utf-8")
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    assert read_verified_source(tmp_path, "pkg/module.py", expected) == "def value(): return 1\n"
+
+    source.write_text("def value(): return 2\n", encoding="utf-8")
+    with pytest.raises(StaleAnalysisError, match="pkg/module.py"):
+        read_verified_source(tmp_path, "pkg/module.py", expected)
+
+
+def test_read_verified_source_rejects_outside_project_paths(tmp_path: Path) -> None:
+    with pytest.raises(StaleAnalysisError, match="outside.py"):
+        read_verified_source(tmp_path, "../outside.py", "0" * 64)

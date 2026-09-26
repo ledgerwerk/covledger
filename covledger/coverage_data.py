@@ -1,10 +1,9 @@
-"""Normalize Coverage.py output and create source-scoped evidence."""
+"""Normalize temporary Coverage.py output into source-hash-only evidence."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +37,7 @@ def _backend() -> dict[str, Any]:
         version = getattr(coverage, "__version__", None)
     except ImportError:
         version = None
-    return {"name": "coverage.py", "version": version, "branch": True}
+    return {"name": "coverage.py", "version": version}
 
 
 def unavailable_coverage(error: BaseException) -> dict[str, Any]:
@@ -56,42 +55,31 @@ def normalize_coverage(
     raw_json: Path,
     *,
     project_root: Path,
-    run_dir: Path,
     allowed_paths: frozenset[str] | set[str] | None = None,
     analysis_scope: AnalysisScope | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    scope_artifact = {
-        "schema_version": 2,
-        "analysis": analysis_scope.to_dict() if analysis_scope is not None else {},
-        "files": {},
-    }
+) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+    """Keep in-scope coverage and source hashes only; never copy source text."""
+    root = project_root.resolve()
     try:
         raw = json.loads(raw_json.read_text(encoding="utf-8"))
     except Exception as exc:
-        return unavailable_coverage(exc), scope_artifact
-    files: dict[str, dict[str, Any]] = {}
-    scope_files: dict[str, dict[str, Any]] = {}
-    source_root = run_dir / "sources"
+        return unavailable_coverage(exc), {}
 
+    files: dict[str, dict[str, Any]] = {}
+    source_state: dict[str, dict[str, str]] = {}
     for raw_path, item in sorted(raw.get("files", {}).items()):
-        summary = item.get("summary", {})
-        source_path = _safe_project_path(project_root, raw_path)
-        if source_path is not None:
-            display_path = relative_to_base(project_root.resolve(), source_path)
-        else:
-            display_path = Path(raw_path).as_posix()
+        source_path = _safe_project_path(root, raw_path)
+        if source_path is None or not source_path.is_file():
+            continue
+        display_path = relative_to_base(root, source_path)
         if allowed_paths is not None and display_path not in allowed_paths:
             continue
-        source_hash = _sha256(source_path) if source_path and source_path.is_file() else None
-        if source_path and source_path.is_file() and source_hash:
-            snapshot = source_root / display_path
-            snapshot.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, snapshot)
-            scope_files[display_path] = {
-                "language": "python",
-                "sha256": source_hash,
-                "snapshot": f"sources/{display_path}",
-            }
+        if analysis_scope is not None and not analysis_scope.allows_path(display_path):
+            continue
+        source_hash = _sha256(source_path)
+        if source_hash is None:
+            continue
+        summary = item.get("summary", {})
         evidence = CoverageFile(
             path=display_path,
             source_sha256=source_hash,
@@ -105,14 +93,13 @@ def normalize_coverage(
             missing_branches=tuple(tuple(map(int, branch)) for branch in item.get("missing_branches", [])),
         )
         files[display_path] = evidence.to_dict()
+        source_state[display_path] = {"sha256": source_hash}
 
     retained = list(files.values())
     statements = sum(int(item["statements"]) for item in retained)
     covered_lines = sum(int(item["covered_lines"]) for item in retained)
     branches = sum(int(item["branches"]) for item in retained)
     covered_branches = sum(int(item["covered_branches"]) for item in retained)
-    executed_lines = tuple(int(line) for line in raw.get("executed_lines", []))
-    executed_branches = tuple(tuple(map(int, branch)) for branch in raw.get("executed_branches", []))
     coverage = {
         "schema_version": 2,
         "status": "available",
@@ -124,19 +111,16 @@ def normalize_coverage(
         "totals": {
             "statements": statements,
             "covered_lines": covered_lines,
-            "executed_lines": list(executed_lines),
             "missing_lines": max(statements - covered_lines, 0),
             "line_percent": 100.0 if statements == 0 else 100.0 * covered_lines / statements,
             "branches": branches,
             "covered_branches": covered_branches,
-            "executed_branches": [list(branch) for branch in executed_branches],
             "missing_branches": max(branches - covered_branches, 0),
             "branch_percent": 100.0 if branches == 0 else 100.0 * covered_branches / branches,
         },
         "files": files,
     }
-    scope_artifact["files"] = scope_files
-    return coverage, scope_artifact
+    return coverage, source_state
 
 
 def function_coverage(function: Any, coverage_file: dict[str, Any]) -> dict[str, Any]:

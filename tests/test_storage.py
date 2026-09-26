@@ -1,133 +1,125 @@
-import json
 import tomllib
 from pathlib import Path
 
 import pytest
-from ledgercore import parse_uuid7
+from ledgercore import uuid7, validate_storage_binding
 
-from covledger.ledgercore_backend import initialize_covledger
+from covledger.ledgercore_backend import CACHE_MOUNT, initialize_covledger
 from covledger.storage import (
+    analysis_config_sha256,
     cache_root,
-    list_run_ids,
-    load_run,
-    new_run_id,
-    publish_run,
-    resolve_run_id,
-    runs_root,
+    clear_cache,
+    clear_current_analysis,
+    create_work_dir,
+    current_analysis_path,
+    load_current_analysis,
+    publish_current_analysis,
+    semantic_cache_path,
 )
 
 
-def test_init_uses_external_runs_and_cache(tmp_path: Path) -> None:
-    initialized = initialize_covledger(tmp_path)
-    manifest = tomllib.loads((tmp_path / ".ledger" / "ledger.toml").read_text())
-    mounts = manifest["ledgers"]["covledger"]["mounts"]
-
-    assert mounts == {
-        "runs": {"storage": "external", "root": "../ledger"},
-        "cache": {"storage": "cache"},
+def _payload(analysis_id: str, suite_passed: bool = True) -> dict:
+    return {
+        "schema_version": 1,
+        "analysis_id": analysis_id,
+        "suite": {"passed": suite_passed, "exit_code": 0 if suite_passed else 1},
+        "coverage": {"status": "unavailable"},
+        "scope": {"config_sha256": "config-hash", "files": {}},
+        "assessment": {"summary": {}, "hotspots": [], "findings": [], "gaps": []},
     }
-    expected_runs = tmp_path.parent / "ledger" / "covledger" / initialized.manifest.project_uuid / "runs"
-    assert runs_root(tmp_path) == expected_runs
-    assert runs_root(tmp_path).is_dir()
-    assert cache_root(tmp_path).is_dir()
-    assert not (tmp_path / ".covledger").exists()
-    assert not (tmp_path / ".ledger" / "covledger" / "runs").exists()
+
+
+def test_cache_root_uses_resolved_ledgercore_mount(tmp_path: Path) -> None:
+    initialized = initialize_covledger(tmp_path)
+
+    assert cache_root(tmp_path) == initialized.layout.mounts[CACHE_MOUNT].path
     assert not (tmp_path / ".ledger" / "covledger" / "cache").exists()
-    assert (tmp_path.parent / "ledger" / ".ledger-store.toml").is_file()
-    assert (runs_root(tmp_path) / ".ledger-project.toml").is_file()
-    assert (tmp_path / ".ledger" / "covledger" / ".ledger-project.toml").is_file()
-    assert (tmp_path / ".ledger" / "covledger" / "config.toml").is_file()
-
-    config = tomllib.loads((tmp_path / ".ledger" / "covledger" / "config.toml").read_text())
-    assert config["analysis"] == {
-        "include_generated": False,
-        "include": [],
-        "exclude": ["context_*.unpack.py"],
-    }
+    assert not (tmp_path.parent / "ledger").exists()
 
 
-def test_init_is_idempotent_and_preserves_run(tmp_path: Path) -> None:
-    first = initialize_covledger(tmp_path)
-    run_id = new_run_id()
-    publish_run(runs_root(tmp_path) / run_id, {"run_id": run_id})
-
-    second = initialize_covledger(tmp_path)
-
-    assert second.manifest.project_uuid == first.manifest.project_uuid
-    assert second.layout.mounts["runs"].path == first.layout.mounts["runs"].path
-    assert list_run_ids(tmp_path) == [run_id]
-    assert load_run(tmp_path, run_id)["run_id"] == run_id
-
-
-def test_published_run_is_immutable_and_latest_resolves(tmp_path: Path) -> None:
+def test_current_analysis_is_one_atomically_replaceable_file(tmp_path: Path) -> None:
     initialize_covledger(tmp_path)
-    first_id = new_run_id()
-    second_id = new_run_id()
-    publish_run(runs_root(tmp_path) / first_id, {"run_id": first_id})
-    publish_run(runs_root(tmp_path) / second_id, {"run_id": second_id})
+    first_id = str(uuid7())
+    second_id = str(uuid7())
 
-    assert load_run(tmp_path, "latest")["run_id"] == max(first_id, second_id)
-    assert resolve_run_id(tmp_path, "latest") == max(first_id, second_id)
-    with pytest.raises(FileExistsError):
-        publish_run(runs_root(tmp_path) / first_id, {"run_id": "rewritten"})
-    assert json.loads((runs_root(tmp_path) / first_id / "run.json").read_text())["run_id"] == first_id
+    path = publish_current_analysis(tmp_path, _payload(first_id))
+    assert path == current_analysis_path(tmp_path)
+    assert load_current_analysis(tmp_path)["analysis_id"] == first_id
 
-
-def test_shared_external_store_isolated_by_project_uuid(tmp_path: Path) -> None:
-    project_a = tmp_path / "project-a"
-    project_b = tmp_path / "project-b"
-    first = initialize_covledger(project_a)
-    second = initialize_covledger(project_b)
-    run_id = new_run_id()
-    publish_run(runs_root(project_a) / run_id, {"run_id": run_id})
-
-    assert first.manifest.project_uuid != second.manifest.project_uuid
-    assert runs_root(project_a) != runs_root(project_b)
-    assert list_run_ids(project_a) == [run_id]
-    assert list_run_ids(project_b) == []
+    publish_current_analysis(tmp_path, _payload(second_id, suite_passed=False))
+    current = load_current_analysis(tmp_path)
+    assert current["analysis_id"] == second_id
+    assert current["suite"]["passed"] is False
+    assert list(cache_root(tmp_path).glob("current*")) == [path]
 
 
-def test_missing_external_store_is_rejected_without_adoption(tmp_path: Path) -> None:
+def test_missing_current_analysis_has_actionable_error(tmp_path: Path) -> None:
     initialize_covledger(tmp_path)
-    marker = tmp_path.parent / "ledger" / ".ledger-store.toml"
-    marker.unlink()
 
-    with pytest.raises(ValueError, match="initialize the external root explicitly"):
-        runs_root(tmp_path)
-    assert not marker.exists()
+    with pytest.raises(FileNotFoundError, match="covledger run -- pytest"):
+        load_current_analysis(tmp_path)
 
 
-def test_no_covledger_fallback(tmp_path: Path) -> None:
-    (tmp_path / ".covledger" / "runs" / "run_20260101T000000Z_aaaaaa").mkdir(parents=True)
+def test_work_directory_is_scoped_under_cache_and_rejects_path_traversal(tmp_path: Path) -> None:
+    initialize_covledger(tmp_path)
+    analysis_id = str(uuid7())
 
-    from covledger.storage import load_covledger_layout
+    work_dir = create_work_dir(tmp_path, analysis_id)
 
-    with pytest.raises(ValueError, match="covledger init"):
-        load_covledger_layout(tmp_path)
+    assert work_dir == cache_root(tmp_path) / "work" / analysis_id
+    assert work_dir.is_dir()
+    with pytest.raises(ValueError, match="invalid CovLedger analysis id"):
+        create_work_dir(tmp_path, "../../outside")
 
 
-def test_new_project_identity_is_uuidv7(tmp_path: Path) -> None:
+def test_clear_current_analysis_removes_only_current_result(tmp_path: Path) -> None:
+    initialize_covledger(tmp_path)
+    publish_current_analysis(tmp_path, _payload(str(uuid7())))
+    semantic = semantic_cache_path(tmp_path, "abc123")
+    semantic.parent.mkdir(parents=True)
+    semantic.write_text("{}", encoding="utf-8")
+
+    clear_current_analysis(tmp_path)
+
+    assert not current_analysis_path(tmp_path).exists()
+    assert semantic.is_file()
+
+
+def test_analysis_config_fingerprint_ignores_formatting_but_tracks_policy(tmp_path: Path) -> None:
+    initialize_covledger(tmp_path)
+    config_path = tmp_path / ".ledger" / "covledger" / "config.toml"
+    original = config_path.read_text(encoding="utf-8")
+    fingerprint = analysis_config_sha256(tmp_path)
+
+    config_path.write_text("# comment\n" + original, encoding="utf-8")
+    assert analysis_config_sha256(tmp_path) == fingerprint
+
+    config_path.write_text(original.replace("include = []", 'include = ["src"]'), encoding="utf-8")
+    assert analysis_config_sha256(tmp_path) != fingerprint
+
+
+def test_clear_cache_removes_only_covledger_cache_children_and_keeps_binding(tmp_path: Path) -> None:
     initialized = initialize_covledger(tmp_path)
+    cache = cache_root(tmp_path)
+    marker = cache / ".ledger-project.toml"
+    marker_contents = marker.read_text(encoding="utf-8")
+    publish_current_analysis(tmp_path, _payload(str(uuid7())))
+    entry = semantic_cache_path(tmp_path, "abc123")
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("{}", encoding="utf-8")
+    work = cache / "work" / str(uuid7())
+    work.mkdir(parents=True)
+    (work / ".coverage").write_text("temporary", encoding="utf-8")
+    unrelated = cache / "unowned.txt"
+    unrelated.write_text("keep", encoding="utf-8")
 
-    assert parse_uuid7(initialized.manifest.project_uuid) is not None
+    clear_cache(tmp_path)
 
-
-def test_init_preserves_unrelated_ledger_registration(tmp_path: Path) -> None:
-    project_uuid = "0192f9bd-7e5e-7d5c-ae7c-2fcd90c4d3cb"
-    manifest = (
-        "schema_version = 3\n\n"
-        "[project]\n"
-        f'uuid = "{project_uuid}"\n'
-        'name = "existing"\n\n'
-        "[ledgers.taskledger.mounts.data]\n"
-        'storage = "project"\n'
-    )
-    (tmp_path / ".ledger").mkdir()
-    (tmp_path / ".ledger" / "ledger.toml").write_text(manifest, encoding="utf-8")
-
-    initialize_covledger(tmp_path)
-    result = tomllib.loads((tmp_path / ".ledger" / "ledger.toml").read_text())
-
-    assert result["project"]["uuid"] == project_uuid
-    assert result["project"]["name"] == "existing"
-    assert result["ledgers"]["taskledger"] == {"mounts": {"data": {"storage": "project"}}}
+    assert not current_analysis_path(tmp_path).exists()
+    assert not (cache / "jev").exists()
+    assert not (cache / "work").exists()
+    assert marker.read_text(encoding="utf-8") == marker_contents
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert validate_storage_binding(initialized.layout.mounts[CACHE_MOUNT]).valid
+    manifest = tomllib.loads((tmp_path / ".ledger" / "ledger.toml").read_text(encoding="utf-8"))
+    assert manifest["ledgers"]["covledger"]["mounts"] == {"cache": {"storage": "cache"}}

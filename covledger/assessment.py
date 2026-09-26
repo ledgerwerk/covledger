@@ -1,4 +1,4 @@
-"""Join immutable CovLedger evidence into deterministic hotspot assessments."""
+"""Build the compact assessment for one in-memory CovLedger analysis."""
 
 from __future__ import annotations
 
@@ -8,32 +8,49 @@ from types import SimpleNamespace
 from typing import Any
 
 from .coverage_data import function_coverage
-from .gaps import GapCandidate, gaps_for_run
+from .decisions import UserDecision, decisions_from_config
+from .gaps import GapCandidate, gaps_for_analysis
 from .identity import function_id
-from .scoring import attention_band, priority_score, quality_score, rules_sha256
-from .storage import list_run_ids, load_covledger_config, load_run, runs_root
+from .scoring import attention_band, priority_score, rules_sha256
+from .storage import load_covledger_config, resolve_source
 
 GAP_ORDER = {"error-path": 0, "branch": 1, "line": 2}
 
 
-def _fresh(root: Path, path: str, expected: str | None) -> str:
-    current = (root / path).resolve()
-    if not current.is_file():
+def _source_status(root: Path, path: str, expected: str | None) -> str:
+    try:
+        current = resolve_source(root, path)
+        if not current.is_file():
+            return "missing"
+        digest = hashlib.sha256(current.read_bytes()).hexdigest()
+    except (OSError, ValueError):
         return "missing"
-    digest = hashlib.sha256(current.read_bytes()).hexdigest()
     return "fresh" if expected and digest == expected else "changed"
 
 
-def _quality_rows(run: dict[str, Any]) -> list[dict[str, Any]]:
+def _quality_rows(analysis: dict[str, Any], decisions: tuple[UserDecision, ...]) -> list[dict[str, Any]]:
+    ignored_symbols = {item.symbol for item in decisions if item.action == "ignore"}
+    ignored_rules: dict[str, set[str]] = {}
+    for item in decisions:
+        if item.action == "ignore-finding" and item.rule is not None:
+            ignored_rules.setdefault(item.symbol, set()).add(item.rule)
     rows: list[dict[str, Any]] = []
-    for path, item in sorted(run.get("quality", {}).get("files", {}).items()):
-        for row in item.get("functions", []):
-            row = dict(row)
+    for path, item in sorted(analysis.get("quality", {}).get("files", {}).items()):
+        for function in item.get("functions", []):
+            symbol = f"{path}:{function['qualname']}"
+            if symbol in ignored_symbols:
+                continue
+            row = dict(function)
             row["path"] = path
             row.setdefault("function_id", function_id(path, row["qualname"]))
+            ignored = ignored_rules.get(symbol, set())
+            row["findings"] = [finding for finding in row.get("findings", []) if finding.get("id") not in ignored]
+            row["semantic_findings"] = [
+                finding for finding in row.get("semantic_findings", []) if finding not in ignored
+            ]
             row.setdefault("facts", {})
             row["facts"] = dict(row["facts"]) | {
-                "exact_findings": [finding.get("id") for finding in row.get("findings", [])],
+                "exact_findings": [finding.get("id") for finding in row["findings"]],
             }
             rows.append(row)
     return rows
@@ -47,8 +64,8 @@ def _function_gaps(gaps: list[GapCandidate], row: dict[str, Any]) -> list[GapCan
     ]
 
 
-def _coverage_for_row(run: dict[str, Any], row: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    item = run.get("coverage", {}).get("files", {}).get(row["path"], {})
+def _coverage_for_row(analysis: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    item = analysis.get("coverage", {}).get("files", {}).get(row["path"], {})
     function = SimpleNamespace(line=row["line"], end_line=row["end_line"])
     return function_coverage(function, item)
 
@@ -67,73 +84,19 @@ def _work_mode(counts: dict[str, int], config: dict[str, Any]) -> dict[str, Any]
     return {"name": "backlog", "reasons": ["fewer_than_one_high_or_critical_hotspot"]}
 
 
-def _regression_scores(root: Path, run: dict[str, Any]) -> dict[str, int]:
-    prior_ids = [run_id for run_id in list_run_ids(root) if run_id < run["run_id"]]
-    if not prior_ids:
-        return {}
-    previous = load_run(root, prior_ids[-1])
-    current_rows = {row["function_id"]: row for row in _quality_rows(run)}
-    previous_rows = {row["function_id"]: row for row in _quality_rows(previous)}
-    current_gaps = gaps_for_run(run, runs_root(root) / run["run_id"])
-    previous_gaps = gaps_for_run(previous, runs_root(root) / previous["run_id"])
-    current_by_function: dict[str, set[str]] = {}
-    previous_by_function: dict[str, set[str]] = {}
-    for gap in current_gaps:
-        if gap.function:
-            current_by_function.setdefault(function_id(gap.path, gap.function["qualname"]), set()).add(gap.kind)
-    for gap in previous_gaps:
-        if gap.function:
-            previous_by_function.setdefault(function_id(gap.path, gap.function["qualname"]), set()).add(gap.kind)
-    result: dict[str, int] = {}
-    for function, row in current_rows.items():
-        old = previous_rows.get(function)
-        if old is None:
-            continue
-        signals: list[int] = []
-        current_kinds = current_by_function.get(function, set())
-        previous_kinds = previous_by_function.get(function, set())
-        current_hash = run.get("coverage", {}).get("files", {}).get(row["path"], {}).get("source_sha256")
-        previous_hash = previous.get("coverage", {}).get("files", {}).get(row["path"], {}).get("source_sha256")
-        if current_hash and current_hash == previous_hash:
-            if "error-path" in current_kinds - previous_kinds:
-                signals.append(100)
-            if "branch" in current_kinds - previous_kinds:
-                signals.append(80)
-        old_facts = old.get("facts", {})
-        current_facts = row.get("facts", {})
-        old_hazards = set(old.get("exact_findings", []))
-        current_hazards = set(row.get("exact_findings", []))
-        if current_hazards - old_hazards:
-            signals.append(60)
-        old_quality = old.get("quality_score", quality_score(old_facts)[2])
-        current_quality = row.get("quality_score", quality_score(current_facts)[2])
-        if current_quality - old_quality >= 20:
-            signals.append(40)
-        old_coverage = previous.get("coverage", {}).get("files", {}).get(row["path"], {})
-        current_coverage = run.get("coverage", {}).get("files", {}).get(row["path"], {})
-        if current_hash == previous_hash and old_coverage.get("statements") and current_coverage.get("statements"):
-            old_percent = 100.0 * old_coverage.get("covered_lines", 0) / old_coverage["statements"]
-            current_percent = 100.0 * current_coverage.get("covered_lines", 0) / current_coverage["statements"]
-            if old_percent - current_percent >= 10:
-                signals.append(20)
-        if signals:
-            result[function] = max(signals)
-    return result
-
-
-def build_assessment(root: Path, run: dict[str, Any], run_dir: Path | None = None) -> dict[str, Any]:
-    run_dir = run_dir or runs_root(root) / run["run_id"]
+def build_assessment(root: Path, analysis: dict[str, Any]) -> dict[str, Any]:
+    """Build prioritization entirely from current source and in-memory evidence."""
     config = load_covledger_config(root)
-    gaps = gaps_for_run(run, run_dir)
-    regressions = _regression_scores(root, run)
+    decisions = decisions_from_config(config)
+    gaps = gaps_for_analysis(analysis, root)
     hotspots: list[dict[str, Any]] = []
     finding_rows: list[dict[str, Any]] = []
-    gap_rows: list[dict[str, Any]] = []
-    for gap in gaps:
-        gap_rows.append(gap.to_dict())
-    for row in _quality_rows(run):
+    gap_rows = [gap.to_dict() for gap in gaps]
+    scope_files = analysis.get("scope", {}).get("files", {})
+
+    for row in _quality_rows(analysis, decisions):
         function_gaps = _function_gaps(gaps, row)
-        coverage = _coverage_for_row(run, row, run_dir)
+        coverage = _coverage_for_row(analysis, row)
         selected_gap = min(function_gaps, key=lambda item: (GAP_ORDER[item.kind], item.line)) if function_gaps else None
         facts = row["facts"]
         breakdown = priority_score(
@@ -141,10 +104,11 @@ def build_assessment(root: Path, run: dict[str, Any], run_dir: Path | None = Non
             gap_kind=selected_gap.kind if selected_gap else None,
             line_missing_ratio=(coverage["missing_lines"] / coverage["statements"]) if coverage["statements"] else 0.0,
             branch_missing_ratio=(coverage["missing_branches"] / coverage["branches"]) if coverage["branches"] else 0.0,
-            regression=regressions.get(row["function_id"]),
+            regression=None,
         )
         score = breakdown.to_dict()
         score["band"] = attention_band(breakdown.priority, config)
+        expected = scope_files.get(row["path"], {}).get("sha256") or row.get("source_sha256")
         hotspot = {
             "id": row["function_id"],
             "path": row["path"],
@@ -156,17 +120,17 @@ def build_assessment(root: Path, run: dict[str, Any], run_dir: Path | None = Non
             "finding_ids": [
                 finding.get("finding_id") for finding in row.get("findings", []) if finding.get("finding_id")
             ],
+            "semantic_findings": row.get("semantic_findings", []),
+            "semantic_judgments": row.get("semantic", {}).get("judgments", {}),
+            "semantic_score": row.get("semantic_score"),
             "gap_ids": [gap.id for gap in function_gaps],
             "score": score,
-            "current_source": _fresh(
-                root,
-                row["path"],
-                run.get("coverage", {}).get("files", {}).get(row["path"], {}).get("source_sha256"),
-            ),
+            "current_source": _source_status(root, row["path"], expected),
         }
         hotspots.append(hotspot)
         for finding in row.get("findings", []):
             finding_rows.append({"function_id": row["function_id"], "path": row["path"], **finding})
+
     counts = {
         band: sum(1 for item in hotspots if item["score"]["band"] == band)
         for band in ("critical", "high", "medium", "low")
@@ -185,7 +149,7 @@ def build_assessment(root: Path, run: dict[str, Any], run_dir: Path | None = Non
     hotspots.sort(key=lambda item: (-item["score"]["priority"], item["path"], item["line"], item["qualname"]))
     return {
         "schema_version": 1,
-        "run_id": run["run_id"],
+        "analysis_id": analysis.get("analysis_id"),
         "scorer": {"name": "covledger-priority", "version": 1, "rules_sha256": rules_sha256()},
         "summary": {
             "functions": len(hotspots),
@@ -202,20 +166,4 @@ def build_assessment(root: Path, run: dict[str, Any], run_dir: Path | None = Non
     }
 
 
-def assessment_for_run(root: Path, run: dict[str, Any], *, persist: bool = False) -> dict[str, Any]:
-    run_id = run["run_id"]
-    run_dir = runs_root(root) / run_id
-    path = run_dir / "assessment.json"
-    if path.is_file():
-        from ledgercore import load_json_object
-
-        return load_json_object(path, label="assessment artifact")
-    assessment = build_assessment(root, run, run_dir)
-    if persist:
-        from ledgercore import atomic_create_text, dumps_json
-
-        atomic_create_text(path, dumps_json(assessment))
-    return assessment
-
-
-__all__ = ["assessment_for_run", "build_assessment"]
+__all__ = ["build_assessment"]
