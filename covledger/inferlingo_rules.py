@@ -55,11 +55,15 @@ def derive_proofs(assessment: dict[str, Any], hotspot: dict[str, Any]) -> list[d
     for query in ("Function {fn} needs error-path review?", "Function {fn} needs structural review?"):
         result = asyncio.run(knowledge.ask(query))
         for solution in result.solutions:
+            rendered = solution.proof.render()
+            source = f"{hotspot['path']}:{hotspot['line']}"
+            if hotspot["path"] not in rendered:
+                rendered = f"{rendered}\nEvidence source: {source}"
             proofs.append(
                 {
                     "query": query,
                     "bindings": dict(solution.bindings),
-                    "rendered": solution.proof.render(),
+                    "rendered": rendered,
                 }
             )
     return proofs
